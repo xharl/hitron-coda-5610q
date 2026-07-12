@@ -1,13 +1,13 @@
 {
   "domain": "hitron_coda_5610q",
   "name": "Hitron CODA-5610Q",
-  "codeowners": ["@xeyve"],
+  "codeowners": ["@xharl"],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://github.com/xeyve/hitron-coda-5610q",
+  "documentation": "https://github.com/xharl/hitron-coda-5610q",
   "integration_type": "device",
   "iot_class": "local_polling",
-  "issue_tracker": "https://github.com/xeyve/hitron-coda-5610q/issues",
+  "issue_tracker": "https://github.com/xharl/hitron-coda-5610q/issues",
   "requirements": [],
   "version": "0.1.0",
   "quality_scale": "bronze"
