@@ -11,7 +11,12 @@ from .api import HitronCodaAPI
 from .const import DEFAULT_SCAN_INTERVAL, DOMAIN
 from .coordinator import HitronCodaCoordinator
 
-PLATFORMS = [Platform.DEVICE_TRACKER, Platform.SENSOR, Platform.BUTTON]
+PLATFORMS = [
+    Platform.DEVICE_TRACKER,
+    Platform.SENSOR,
+    Platform.BUTTON,
+    Platform.BINARY_SENSOR,
+]
 
 # No YAML config — config flow only
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)

@@ -3,18 +3,39 @@
 A custom [Home Assistant](https://www.home-assistant.io/) integration for the
 **Rogers / Fizz Hitron CODA-5610Q** DOCSIS 3.1 cable modem / WiFi 6 router.
 
-This is the only integration that works with the CODA-5610Q. The built-in
+The only integration that works with the CODA-5610Q. The built-in
 `hitron_coda` integration targets the older CODA-4582U and does not work
 with this model.
 
 ## Features
 
-- **Device tracker** — presence detection via WiFi-MAC tracking (one entity
-  per connected device, `SourceType.ROUTER`)
-- **DOCSIS diagnostics** *(planned)* — downstream SNR, upstream power,
-  channel frequencies
-- **Reboot button** *(planned)* — reboot the router from HA
-- **Pause/resume client** *(planned)* — pause a device's internet access
+### Device Tracker
+- One `device_tracker` entity per connected device (MAC-based)
+- WiFi RSSI, band, SSID, bitrate, channel as extra attributes
+- Source type: `router`
+- Pause/resume buttons per device
+
+### Sensors
+- **Connected devices count** — total devices on LAN
+- **WAN/LAN uptime** — seconds
+- **WAN/LAN traffic** — RX/TX bytes
+- **WAN IP address** — current public IP
+- **Cable Modem IP** — CM-side IP from CMTS
+- **Firewall level** — current security level
+- **DOCSIS data rates** — downstream/upstream rates
+- **Per-downstream-channel SNR** — dB per channel
+- **Per-downstream-channel power** — dBmV per channel
+- **Per-upstream-channel power** — dBmV per channel
+
+### Binary Sensors
+- **DOCSIS provisioning steps** — hwInit, findDownstream, ranging, dhcp, timeOfday, downloadCfg, registration
+- **Network access** — whether the CMTS permits traffic
+- **Firewall enabled** — on/off
+- **WiFi radio on/off** — per band (2.4G / 5G)
+- **Ethernet port link** — per port (with WAN port identified)
+
+### Buttons
+- **Pause** / **Resume** per device — control internet access per MAC
 
 ## Installation
 
@@ -38,7 +59,7 @@ Copy the `custom_components/hitron_coda_5610q/` directory into your
 |-------|---------|-------------|
 | Host | — | Router IP address (usually `192.168.0.1`) |
 | Username | `cusadmin` | Router admin username |
-| Password | — | Router admin password (usually the WiFi password) |
+| Password | — | Router admin password (often the WiFi password) |
 
 ## Supported devices
 
@@ -48,11 +69,13 @@ Copy the `custom_components/hitron_coda_5610q/` directory into your
 ## Troubleshooting
 
 - **"Invalid password"** — the CODA-5610Q uses the WiFi password as the admin
-  password (not a separate web admin password like older models)
-- **Devices not appearing** — the router's connected device list takes a few
-  seconds to load. The integration polls every 30 seconds by default
+  password on ISP-locked units
+- **Devices not appearing** — the integration polls every 30 seconds; the
+  router's device list takes 1-3 seconds to respond
 - **Connection drops** — the PHPSESSID cookie can expire. The integration
   re-logs in automatically on 401/403
+- **RSSI not showing** — only WiFi-connected clients have RSSI; Ethernet
+  devices don't have this attribute
 
 ## Development
 

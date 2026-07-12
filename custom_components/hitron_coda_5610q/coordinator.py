@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
@@ -16,9 +16,12 @@ from homeassistant.helpers.update_coordinator import (
 
 from .api import (
     ConnectedDevice,
+    DownstreamChannel,
     HitronAuthError,
     HitronConnectionError,
     HitronCodaAPI,
+    SystemInfo,
+    UpstreamChannel,
 )
 from .const import DEFAULT_SCAN_INTERVAL, DOMAIN
 
@@ -27,8 +30,20 @@ _LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class HitronCodaData:
+    """Aggregated data from all router endpoints."""
+
     devices: list[ConnectedDevice]
-    sys_info: dict
+    system_info: SystemInfo
+    router_sys_info: dict
+    downstream_channels: list[DownstreamChannel]
+    upstream_channels: list[UpstreamChannel]
+    dhcp_reservations: list[dict]
+    wifi_clients: list[dict] = field(default_factory=list)
+    docsis_provisioning: dict = field(default_factory=dict)
+    cm_sys_info: dict = field(default_factory=dict)
+    wifi_radios: list[dict] = field(default_factory=list)
+    firewall_status: dict = field(default_factory=dict)
+    ethernet_ports: list[dict] = field(default_factory=list)
 
 
 class HitronCodaCoordinator(DataUpdateCoordinator[HitronCodaData]):
@@ -49,18 +64,52 @@ class HitronCodaCoordinator(DataUpdateCoordinator[HitronCodaData]):
             update_interval=scan_interval,
         )
         self.api = api
-        self._failed_auth = False
 
     async def _async_update_data(self) -> HitronCodaData:
         try:
-            devices, sys_info = await asyncio.gather(
+            (
+                devices,
+                system_info,
+                router_sys_info,
+                ds_channels,
+                us_channels,
+                reservations,
+                wifi_clients,
+                docs_prov,
+                cm_sys,
+                wifi_radios,
+                firewall,
+                eth_ports,
+            ) = await asyncio.gather(
                 self.api.get_connected_devices(),
                 self.api.get_system_info(),
+                self.api.get_router_sys_info(),
+                self.api.get_downstream_channels(),
+                self.api.get_upstream_channels(),
+                self.api.get_dhcp_reservations(),
+                self.api.get_wifi_clients(),
+                self.api.get_docsis_provisioning(),
+                self.api.get_cm_sys_info(),
+                self.api.get_wifi_radios(),
+                self.api.get_firewall_status(),
+                self.api.get_ethernet_ports(),
             )
         except HitronAuthError as err:
             raise ConfigEntryAuthFailed(err) from err
         except HitronConnectionError as err:
             raise UpdateFailed(f"Router error: {err}") from err
 
-        self._failed_auth = False
-        return HitronCodaData(devices=devices, sys_info=sys_info)
+        return HitronCodaData(
+            devices=devices,
+            system_info=system_info,
+            router_sys_info=router_sys_info,
+            downstream_channels=ds_channels,
+            upstream_channels=us_channels,
+            dhcp_reservations=reservations,
+            wifi_clients=wifi_clients,
+            docsis_provisioning=docs_prov,
+            cm_sys_info=cm_sys,
+            wifi_radios=wifi_radios,
+            firewall_status=firewall,
+            ethernet_ports=eth_ports,
+        )

@@ -39,10 +39,12 @@ class HitronCodaDeviceTracker(CoordinatorEntity[HitronCodaCoordinator], TrackerE
     @property
     def device_info(self) -> DeviceInfo:
         return DeviceInfo(
-            identifiers={(DOMAIN, "router")},
+            identifiers={(DOMAIN, self.coordinator.data.system_info.serial_number)},
             manufacturer=MANUFACTURER,
             model=MODEL,
             name="Hitron CODA-5610Q",
+            sw_version=self.coordinator.data.system_info.software_version,
+            hw_version=self.coordinator.data.system_info.hardware_version,
         )
 
     @property
@@ -60,7 +62,7 @@ class HitronCodaDeviceTracker(CoordinatorEntity[HitronCodaCoordinator], TrackerE
     def is_connected(self) -> bool:
         for d in self.coordinator.data.devices:
             if d.mac_address == self._mac:
-                return d.status == "Active"
+                return d.status
         return False
 
     @property
@@ -69,3 +71,24 @@ class HitronCodaDeviceTracker(CoordinatorEntity[HitronCodaCoordinator], TrackerE
             if d.mac_address == self._mac:
                 return d.ip_address
         return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str]:
+        """Return extra attributes for the device tracker."""
+        attrs: dict[str, str] = {}
+        for d in self.coordinator.data.devices:
+            if d.mac_address == self._mac:
+                attrs["interface"] = d.interface
+                attrs["address_source"] = d.address_source
+                attrs["action"] = d.action
+                break
+        # Enrich with WiFi client info (RSSI, channel, bitrate) if available
+        for wc in self.coordinator.data.wifi_clients:
+            if wc.get("mac_address") == self._mac:
+                attrs["rssi"] = wc["rssi"]
+                attrs["wifi_band"] = wc["band"]
+                attrs["wifi_ssid"] = wc["ssid"]
+                attrs["wifi_bitrate"] = wc["bitrate"]
+                attrs["wifi_channel"] = wc["channel"]
+                break
+        return attrs
