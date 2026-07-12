@@ -1,0 +1,22 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Hitron CODA-5610Q",
+        "description": "Connect to your Rogers Hitron CODA-5610Q router.",
+        "data": {
+          "host": "Router IP address",
+          "username": "Username",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the router.",
+      "invalid_auth": "Invalid password."
+    },
+    "abort": {
+      "already_configured": "This router is already configured."
+    }
+  }
+}
