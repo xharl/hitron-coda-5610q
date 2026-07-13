@@ -54,12 +54,19 @@ class HitronCodaCoordinator(DataUpdateCoordinator[HitronCodaData]):
     def __init__(
         self,
         hass: HomeAssistant,
+        config_entry: ConfigEntry,
         api: HitronCodaAPI,
         scan_interval: timedelta,
     ) -> None:
+        # Pass config_entry explicitly. In HA 2026.8+ this will be
+        # required; in 2026.7 it avoids a deprecation warning AND
+        # ensures the update loop is properly scheduled (the
+        # update_interval setter checks self.config_entry, which is
+        # not set yet when init defaults to UNDEFINED).
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=config_entry,
             name=DOMAIN,
             update_interval=scan_interval,
         )

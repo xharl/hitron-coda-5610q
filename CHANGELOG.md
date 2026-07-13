@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.8 — 2026-07-13
+
+### Fixed
+- **Coordinator ran only once at setup and never again** — entities existed in
+  the registry but no state was ever written to the state machine. Root cause:
+  the `DataUpdateCoordinator` in HA 2026.7+ uses the `update_interval` setter
+  internally to schedule the periodic refresh, but that setter calls
+  `_schedule_refresh()` which reads `self.config_entry` — which is only set
+  AFTER `update_interval` in `__init__`. Since the integration was using
+  the deprecated `config_entry=UNDEFINED` form, `self.config_entry` was
+  `None` when the setter ran, and the scheduling silently failed.
+  The first refresh succeeded (it doesn't go through the update_interval
+  setter), but the update loop was never started.
+- Pass `config_entry` explicitly to the `DataUpdateCoordinator` super
+  initializer. This both silences the deprecation warning and ensures the
+  periodic update loop is properly registered.
+
 ## 0.2.7 — 2026-07-13
 
 ### Fixed

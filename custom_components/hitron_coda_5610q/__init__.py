@@ -54,7 +54,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             DEFAULT_SCAN_INTERVAL,
         )
 
-        coordinator = HitronCodaCoordinator(hass, api, scan_interval)
+        coordinator = HitronCodaCoordinator(hass, entry, api, scan_interval)
         _LOGGER.warning("hitron_coda_5610q: starting first refresh")
         await coordinator.async_config_entry_first_refresh()
         _LOGGER.warning("hitron_coda_5610q: first refresh OK")
