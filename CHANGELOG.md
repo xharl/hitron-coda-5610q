@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.9 — 2026-07-13
+
+### Fixed
+- **v0.2.8 was insufficient** — even passing `config_entry` explicitly
+  didn't fix the scheduling because the `update_interval` setter runs
+  BEFORE `self.config_entry` is assigned in `DataUpdateCoordinator.__init__`.
+  Set `self.config_entry = config_entry` before calling `super().__init__()`
+  so the setter's `_schedule_refresh()` can correctly read it and register
+  the periodic update loop.
+
 ## 0.2.8 — 2026-07-13
 
 ### Fixed

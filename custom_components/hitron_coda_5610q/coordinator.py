@@ -58,11 +58,15 @@ class HitronCodaCoordinator(DataUpdateCoordinator[HitronCodaData]):
         api: HitronCodaAPI,
         scan_interval: timedelta,
     ) -> None:
-        # Pass config_entry explicitly. In HA 2026.8+ this will be
-        # required; in 2026.7 it avoids a deprecation warning AND
-        # ensures the update loop is properly scheduled (the
-        # update_interval setter checks self.config_entry, which is
-        # not set yet when init defaults to UNDEFINED).
+        # IMPORTANT: assign self.config_entry BEFORE assigning
+        # update_interval. The DataUpdateCoordinator's update_interval
+        # setter calls _schedule_refresh() which reads self.config_entry
+        # to decide whether to skip polling (for pref_disable_polling
+        # entries). If config_entry isn't set yet, the scheduling
+        # silently fails. This is the root cause of "entities exist
+        # but no state is ever recorded" in HA 2026.7 — the periodic
+        # update loop never registered.
+        self.config_entry = config_entry
         super().__init__(
             hass,
             _LOGGER,
