@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from homeassistant.components.device_tracker import SourceType, TrackerEntity
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import STATE_HOME, STATE_NOT_HOME
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -46,6 +47,15 @@ class HitronCodaDeviceTracker(CoordinatorEntity[HitronCodaCoordinator], TrackerE
             sw_version=self.coordinator.data.system_info.software_version,
             hw_version=self.coordinator.data.system_info.hardware_version,
         )
+
+    @property
+    def state(self) -> str:
+        # TrackerEntity.state (in HA 2026.x) returns None unless the
+        # entity has a location_name or a configured zone. For
+        # router-based tracking (no GPS, no zones), we have to override
+        # state ourselves to return STATE_HOME / STATE_NOT_HOME based
+        # on the device's Active/Paused status from the router.
+        return STATE_HOME if self.is_connected else STATE_NOT_HOME
 
     @property
     def mac_address(self) -> str:

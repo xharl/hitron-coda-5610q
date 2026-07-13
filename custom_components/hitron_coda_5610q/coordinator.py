@@ -58,16 +58,11 @@ class HitronCodaCoordinator(DataUpdateCoordinator[HitronCodaData]):
         api: HitronCodaAPI,
         scan_interval: timedelta,
     ) -> None:
-        # IMPORTANT: assign self.config_entry BEFORE super().__init__()
-        # so the update_interval setter can read it. Then, after
-        # super().__init__() returns, schedule the first refresh
-        # EXPLICITLY — the DataUpdateCoordinator only schedules the
-        # periodic update loop at the END of _async_refresh(), and
-        # only if self._listeners is non-empty. If no entities have
-        # called async_add_listener() yet (which is common at setup
-        # time, before the entity platforms have been forwarded),
-        # the periodic update never starts and the coordinator
-        # only runs the initial first_refresh once.
+        # Assign self.config_entry BEFORE super().__init__() so the
+        # update_interval setter and the per-config-entry async_on_unload
+        # registration in the parent class both have it available.
+        # (In HA 2026.7, the setter reads self.config_entry; in 2026.8+
+        # the explicit pass is required.)
         self.config_entry = config_entry
         super().__init__(
             hass,
@@ -77,25 +72,16 @@ class HitronCodaCoordinator(DataUpdateCoordinator[HitronCodaData]):
             update_interval=scan_interval,
         )
         self.api = api
-        # Register the periodic update loop. The first call inside
-        # __init__ may no-op if self._listeners is empty, but
-        # _schedule_refresh is safe to call multiple times — it
-        # cancels any prior schedule before installing a new one.
-        # The platform's async_setup_entry calls
-        # async_forward_entry_setups() which sets up entities that
-        # register themselves as listeners; we re-schedule after
-        # that to make sure the loop is in place once listeners
-        # are registered. See __init__.py.
-        _LOGGER.warning(
-            "hitron_coda_5610q: scheduling refresh; _listeners=%d, update_interval=%s",
-            len(self._listeners),
-            self._update_interval_seconds,
-        )
+        # Schedule the periodic update loop explicitly. The
+        # DataUpdateCoordinator only reschedules itself at the END of
+        # _async_refresh, and only if self._listeners is non-empty.
+        # At the time of the initial first refresh (before
+        # async_forward_entry_setups has run), no listeners exist yet
+        # and the loop would never get registered. _schedule_refresh
+        # is safe to call with an empty listener set — it just
+        # installs the timer; the listener check happens later in
+        # the finally block of _async_refresh.
         self._schedule_refresh()
-        _LOGGER.warning(
-            "hitron_coda_5610q: schedule installed; _unsub_refresh=%s",
-            self._unsub_refresh is not None,
-        )
 
     async def _async_update_data(self) -> HitronCodaData:
         # The CODA-5610Q's web server cannot reliably handle 12

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.11 — 2026-07-13
+
+### Fixed
+- **Device tracker entities always showed state `unknown`** —
+  `TrackerEntity.state` in HA 2026.x returns `None` (which becomes
+  `unknown`) unless the entity has a `location_name` set or is
+  member of a configured zone. The router-based integration has
+  neither — devices don't have GPS coordinates. Override `state`
+  in `HitronCodaDeviceTracker` to return `STATE_HOME` if
+  `is_connected` else `STATE_NOT_HOME`, based on the device's
+  Active/Paused status from the router's `/1/Device/Hosts/1`
+  endpoint.
+- Cleaned up the v0.2.10 debug logging from `coordinator.__init__`
+  and `__init__.py` — fix is verified working on the live Pi, no
+  longer need the verbose output.
+
 ## 0.2.10 — 2026-07-13
 
 ### Fixed
