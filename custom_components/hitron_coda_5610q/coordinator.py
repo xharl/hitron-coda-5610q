@@ -58,14 +58,16 @@ class HitronCodaCoordinator(DataUpdateCoordinator[HitronCodaData]):
         api: HitronCodaAPI,
         scan_interval: timedelta,
     ) -> None:
-        # IMPORTANT: assign self.config_entry BEFORE assigning
-        # update_interval. The DataUpdateCoordinator's update_interval
-        # setter calls _schedule_refresh() which reads self.config_entry
-        # to decide whether to skip polling (for pref_disable_polling
-        # entries). If config_entry isn't set yet, the scheduling
-        # silently fails. This is the root cause of "entities exist
-        # but no state is ever recorded" in HA 2026.7 — the periodic
-        # update loop never registered.
+        # IMPORTANT: assign self.config_entry BEFORE super().__init__()
+        # so the update_interval setter can read it. Then, after
+        # super().__init__() returns, schedule the first refresh
+        # EXPLICITLY — the DataUpdateCoordinator only schedules the
+        # periodic update loop at the END of _async_refresh(), and
+        # only if self._listeners is non-empty. If no entities have
+        # called async_add_listener() yet (which is common at setup
+        # time, before the entity platforms have been forwarded),
+        # the periodic update never starts and the coordinator
+        # only runs the initial first_refresh once.
         self.config_entry = config_entry
         super().__init__(
             hass,
@@ -75,6 +77,16 @@ class HitronCodaCoordinator(DataUpdateCoordinator[HitronCodaData]):
             update_interval=scan_interval,
         )
         self.api = api
+        # Register the periodic update loop. The first call inside
+        # __init__ may no-op if self._listeners is empty, but
+        # _schedule_refresh is safe to call multiple times — it
+        # cancels any prior schedule before installing a new one.
+        # The platform's async_setup_entry calls
+        # async_forward_entry_setups() which sets up entities that
+        # register themselves as listeners; we re-schedule after
+        # that to make sure the loop is in place once listeners
+        # are registered. See __init__.py.
+        self._schedule_refresh()
 
     async def _async_update_data(self) -> HitronCodaData:
         # The CODA-5610Q's web server cannot reliably handle 12

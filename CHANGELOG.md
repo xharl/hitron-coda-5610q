@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.10 — 2026-07-13
+
+### Fixed
+- **Coordinator only ran the initial first_refresh, never periodic updates**
+  — the actual root cause of "entities exist but no state is ever recorded".
+  `DataUpdateCoordinator._async_refresh` only calls `self._schedule_refresh()`
+  at the END of the method (in a `finally` block), and ONLY if
+  `self._listeners` is non-empty. If no entities have called
+  `async_add_listener()` yet — which is the case at first setup, BEFORE
+  `async_forward_entry_setups()` has wired up the platform entities — the
+  periodic update loop never registers. The first refresh succeeds, the
+  forwards happen, but the loop is never started.
+- Explicitly call `self._schedule_refresh()` in the coordinator's
+  `__init__` (it will be a no-op if listeners haven't registered yet, but
+  the call is safe) and again in `__init__.py`'s `async_setup_entry` AFTER
+  `async_forward_entry_setups()` returns, once all entity platforms have
+  registered their listeners.
+
 ## 0.2.9 — 2026-07-13
 
 ### Fixed

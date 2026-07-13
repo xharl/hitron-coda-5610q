@@ -65,6 +65,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
         _LOGGER.warning("hitron_coda_5610q: forwards OK")
 
+        # The DataUpdateCoordinator only schedules its periodic update
+        # loop in _async_refresh's finally block, AND only if
+        # self._listeners is non-empty. At this point (after
+        # async_forward_entry_setups), entity platforms have registered
+        # their listeners — so trigger an explicit schedule to make
+        # sure the loop is now in place. This is the v0.2.10 fix for
+        # "entities exist but never update".
+        coordinator._schedule_refresh()
+
         entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
         # Close the session when the entry is unloaded
