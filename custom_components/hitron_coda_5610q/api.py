@@ -109,22 +109,35 @@ class HitronCodaAPI:
         The router returns Content-Type: text/html for JSON, so we
         must use content_type=None. If the response looks like a
         login page redirect, we re-login once.
+
+        Any aiohttp client error (timeout, connection refused, DNS
+        failure, etc.) is translated into ``HitronConnectionError`` so
+        the config flow and ``__init__.py`` can handle it uniformly
+        without importing aiohttp.
         """
         headers = {
             "X-Requested-With": "XMLHttpRequest",
             "Referer": str(self._base / "webpages/index.html"),
         }
-        async with self._session.get(
-            url, cookies=self._cookies, headers=headers
-        ) as resp:
-            if resp.status in (401, 403):
-                # Session expired — re-login once
-                await self.login()
-                async with self._session.get(
-                    url, cookies=self._cookies, headers=headers
-                ) as resp2:
-                    return await resp2.json(content_type=None)
-            return await resp.json(content_type=None)
+        try:
+            async with self._session.get(
+                url, cookies=self._cookies, headers=headers
+            ) as resp:
+                if resp.status in (401, 403):
+                    # Session expired — re-login once
+                    await self.login()
+                    async with self._session.get(
+                        url, cookies=self._cookies, headers=headers
+                    ) as resp2:
+                        return await resp2.json(content_type=None)
+                return await resp.json(content_type=None)
+        except aiohttp.ClientError as err:
+            raise HitronConnectionError(str(err)) from err
+        except (ValueError, KeyError, TypeError) as err:
+            # Malformed JSON / unexpected payload shape from the router.
+            raise HitronConnectionError(
+                f"Bad response from {url}: {err}"
+            ) from err
 
     async def login(self) -> None:
         """Authenticate and store the session cookie.
@@ -136,6 +149,10 @@ class HitronCodaAPI:
         authentication failure. The discriminator is the ``result`` field
         (e.g. ``"success"`` vs ``"Error_Password_Wrong"``). Checking only
         ``errCode`` causes wrong passwords to be accepted as valid logins.
+
+        aiohttp client errors (timeout, DNS failure, connection refused,
+        etc.) are translated to ``HitronConnectionError`` so the config
+        flow shows "Failed to connect" instead of "Unknown error".
         """
         url = self._base / "1/Device/Users/Login"
         form = aiohttp.FormData()
@@ -143,32 +160,38 @@ class HitronCodaAPI:
             "model",
             f'{{"username":"{self._username}","password":"{self._password}"}}',
         )
-        async with self._session.post(url, data=form) as resp:
-            if resp.status != 200:
-                raise HitronConnectionError(f"Login HTTP {resp.status}")
-            payload = await resp.json(content_type=None)
+        try:
+            async with self._session.post(url, data=form) as resp:
+                if resp.status != 200:
+                    raise HitronConnectionError(f"Login HTTP {resp.status}")
+                payload = await resp.json(content_type=None)
+                set_cookie_headers = resp.headers.getall("Set-Cookie", [])
+        except aiohttp.ClientError as err:
+            raise HitronConnectionError(str(err)) from err
+        except (ValueError, KeyError, TypeError) as err:
+            raise HitronConnectionError(
+                f"Bad login response: {err}"
+            ) from err
 
-            # errCode is unreliable on this firmware — both "success" and
-            # auth failures return "000". Use the "result" field instead.
-            result = payload.get("result", "")
-            if payload.get("errCode") != "000" or result.startswith("Error_"):
-                raise HitronAuthError(
-                    result or payload.get("errMsg") or "login failed"
-                )
+        # errCode is unreliable on this firmware — both "success" and
+        # auth failures return "000". Use the "result" field instead.
+        result = payload.get("result", "")
+        if payload.get("errCode") != "000" or result.startswith("Error_"):
+            raise HitronAuthError(
+                result or payload.get("errMsg") or "login failed"
+            )
 
-            # Read the session cookie directly from the response headers.
-            # aiohttp's session.cookie_jar is not reliably populated for
-            # POST requests (the default jar only updates for matching
-            # host requests and FormData POSTs have a version-specific
-            # quirk where Set-Cookie isn't stored). The response header
-            # is the source of truth.
-            for raw in resp.headers.getall("Set-Cookie", []):
-                name, _, rest = raw.partition("=")
-                if name.strip() == "PHPSESSID":
-                    value = rest.split(";", 1)[0].strip()
-                    self._cookies = {"PHPSESSID": value}
-                    return
-            raise HitronAuthError("No PHPSESSID cookie set")
+        # Read the session cookie from the captured Set-Cookie headers
+        # (must be captured inside the `async with` block since `resp`
+        # is closed after the context manager exits). aiohttp's session
+        # cookie_jar is not reliably populated for POST requests.
+        for raw in set_cookie_headers:
+            name, _, rest = raw.partition("=")
+            if name.strip() == "PHPSESSID":
+                value = rest.split(";", 1)[0].strip()
+                self._cookies = {"PHPSESSID": value}
+                return
+        raise HitronAuthError("No PHPSESSID cookie set")
 
     async def get_connected_devices(self) -> list[ConnectedDevice]:
         """Fetch the current connected device list.

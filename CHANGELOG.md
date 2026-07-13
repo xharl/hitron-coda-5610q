@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.2 — 2026-07-13
+
+### Fixed
+- **Config flow showed "Unknown error" instead of "Failed to connect" for
+  unreachable hosts.** aiohttp raises `aiohttp.ClientError` subclasses
+  (`ConnectionTimeoutError`, `ClientConnectorError`, etc.) on network
+  failures. The config flow only caught `HitronConnectionError`, so any
+  aiohttp client error escaped as an unhandled exception. Now `login()`
+  and `_request_json()` translate aiohttp client errors and malformed
+  payloads into `HitronConnectionError` at the API boundary.
+
 ## 0.2.1 — 2026-07-13
 
 ### Fixed

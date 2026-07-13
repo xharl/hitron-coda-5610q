@@ -3,12 +3,14 @@ import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import pytest
 
 from custom_components.hitron_coda_5610q.api import (
     ConnectedDevice,
     HitronAuthError,
     HitronCodaAPI,
+    HitronConnectionError,
     SystemInfo,
 )
 
@@ -137,6 +139,67 @@ async def test_login_fails_when_set_cookie_missing():
     )
     api = HitronCodaAPI(session, HOST, "cusadmin", "password")
     with pytest.raises(HitronAuthError, match="No PHPSESSID"):
+        await api.login()
+
+
+async def test_login_translates_aiohttp_timeout_to_connection_error():
+    """Regression: aiohttp.ConnectionTimeoutError must surface as
+    HitronConnectionError, not an unhandled exception. Without this
+    translation the config flow shows "Unknown error" instead of
+    "Failed to connect" when the host is unreachable.
+    """
+    session = MagicMock()
+
+    class _TimeoutCM:
+        async def __aenter__(self):
+            raise aiohttp.ConnectionTimeoutError("timeout")
+        async def __aexit__(self, *args):
+            return False
+
+    session.post = lambda url, data=None: _TimeoutCM()
+    api = HitronCodaAPI(session, HOST, "cusadmin", "password")
+    with pytest.raises(HitronConnectionError, match="timeout"):
+        await api.login()
+
+
+async def test_login_translates_aiohttp_connector_error_to_connection_error():
+    """ClientConnectorError (DNS failure / connection refused) is also translated."""
+    session = MagicMock()
+
+    class _ConnCM:
+        async def __aenter__(self):
+            raise aiohttp.ClientConnectorError(
+                connection_key=MagicMock(), os_error=OSError("Connection refused")
+            )
+        async def __aexit__(self, *args):
+            return False
+
+    session.post = lambda url, data=None: _ConnCM()
+    api = HitronCodaAPI(session, HOST, "cusadmin", "password")
+    with pytest.raises(HitronConnectionError):
+        await api.login()
+
+
+async def test_login_translates_malformed_json_to_connection_error():
+    """If the router returns a non-JSON response, treat it as a connection error
+    rather than letting the JSONDecodeError escape."""
+    session = MagicMock()
+
+    class _BadJsonResponse:
+        status = 200
+        def __init__(self):
+            self.headers = MagicMock()
+            self.headers.getall = lambda name, default=[]: default
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def json(self, content_type=None):
+            raise ValueError("not json")
+
+    session.post = lambda url, data=None: _BadJsonResponse()
+    api = HitronCodaAPI(session, HOST, "cusadmin", "password")
+    with pytest.raises(HitronConnectionError, match="Bad login response"):
         await api.login()
 
 
