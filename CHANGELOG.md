@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.3 — 2026-07-13
+
+### Fixed
+- **Config flow raised `TypeError: 'SystemInfo' object is not subscriptable`** on
+  every successful login. The config flow treated `get_system_info()`'s return
+  value as a dict (`info["SerialNum"]`) but it is a `SystemInfo` dataclass.
+  Use `info.serial_number` instead.
+
 ## 0.2.2 — 2026-07-13
 
 ### Fixed

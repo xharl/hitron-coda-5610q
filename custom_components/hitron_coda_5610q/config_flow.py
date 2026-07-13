@@ -54,8 +54,9 @@ class HitronCodaConfigFlow(ConfigFlow, domain=DOMAIN):
             except HitronConnectionError:
                 errors["base"] = "cannot_connect"
             else:
-                # Use the serial number as the unique id
-                await self.async_set_unique_id(info["SerialNum"])
+                # Use the serial number as the unique id. ``info`` is a
+                # SystemInfo dataclass (not a dict), so use attribute access.
+                await self.async_set_unique_id(info.serial_number)
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(
                     title=f"Hitron CODA-5610Q ({user_input[CONF_HOST]})",
