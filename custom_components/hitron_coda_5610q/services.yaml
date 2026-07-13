@@ -1,0 +1,10 @@
+# Services exposed by the Hitron CODA-5610Q integration.
+# Listed here so HA's services panel shows them and the API can validate
+# call parameters. The service handler is in device_tracker.py.
+migrate_to_v0_2_13:
+  name: Migrate to v0.2.13 (hostname-keyed entities)
+  description: >
+    One-shot migration that renames existing v0.2.12 MAC-keyed device_tracker
+    unique_ids to v0.2.13 hostname-keyed unique_ids, then reloads the config
+    entry. See MIGRATION.md for the full procedure.
+  fields: {}

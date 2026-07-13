@@ -1,6 +1,69 @@
 # Changelog
 
-## 0.2.12 — 2026-07-13
+## 0.2.14 — 2026-07-13
+
+### Changed
+- **Per-channel DOCSIS power/SNR sensors are now opt-in.** The
+  v0.2.13 default of always-on created 32+ entities on a healthy
+  cable plant (16 DS power + 16 DS SNR), plus 4 upstream power
+  sensors. These are now behind a `CONF_EXPOSE_DIAGNOSTICS` config
+  option that defaults to **off**. Toggle it on in the integration's
+  options panel only when you need to debug cable plant issues.
+
+### Removed
+- **Per-device pause/resume buttons (42 entities).** v0.2.12 added
+  these for parental-controls use, but they were rarely used and
+  the v0.2.13 device_tracker change broke their unique_id keys
+  (collisions in the HA log). If you actually need to pause a
+  device's internet access from HA, do it through the router's
+  web UI, or call the `hitron_coda_5610q.pause_device` service
+  directly.
+- **DOCSIS provisioning step binary sensors (7 entities).** The
+  `docsis_hwinit` / `docsis_ranging` / `docsis_dhcp` / etc.
+  binary sensors were always on during normal operation and
+  unreachable when the modem was down — pure UI noise. The fact
+  that the integration is talking to the router is the actual
+  signal that the modem is up.
+
+## 0.2.13 — 2026-07-13
+
+### Fixed
+- **MAC-rotation drift in Leave Home / Arrival automations.** v0.2.12
+  keyed each device_tracker entity on its MAC address. Devices that
+  use "Private WiFi Address" (iOS / macOS) or randomized MAC
+  (Android 10+) would create a *new* entity on every reconnect, and
+  the old entity stayed in the entity registry forever in
+  `not_home` state. When the device_tracker was added to a person
+  entity (e.g. `person.xavier`), the person-picker would oscillate
+  between the old (always not_home) and new entities, causing
+  the Leave Home automation to misfire even when the user was
+  physically at home.
+
+  v0.2.13 keys entities on the router-reported **hostname** by
+  default. The hostname is stable for any device that doesn't
+  override it, so the entity_id never changes when the device
+  rotates its MAC. The current MAC is exposed as the
+  `current_mac` attribute and updated in place on every scan.
+
+  Migration: a one-shot service `hitron_coda_5610q.migrate_to_v0_2_13`
+  renames existing v0.2.12 (MAC-keyed) entities to v0.2.13
+  (hostname-keyed) unique_ids and reloads the config entry.
+  See `MIGRATION.md` for the full procedure.
+
+- **Hostname normalization.** Routers sometimes report hostnames
+  with leading/trailing whitespace, mixed case, or unicode
+  characters. `normalize_hostname()` strips and lower-cases, and
+  replaces non-alphanumeric characters with `_` so the resulting
+  unique_id is filesystem-safe and stable across scans.
+
+### Notes
+- The v0.2.13 default tracking mode is `hostname`. Users who want
+  the v0.2.12 (MAC-keyed) behavior can set
+  `track_by: mac` in the config-entry options.
+- Hostname collisions (e.g. two devices both reporting
+  `android` as their hostname) are disambiguated with `_1`, `_2`
+  suffixes on the identity key. Rare in practice.
+
 
 ### Fixed
 - **All 21 device_tracker entities were collapsed under a single device

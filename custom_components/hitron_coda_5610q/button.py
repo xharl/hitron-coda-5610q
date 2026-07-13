@@ -1,114 +1,14 @@
 """Button entities for the Hitron CODA-5610Q.
 
-Provides per-device pause/resume buttons.
+v0.2.14: removed the per-device pause/resume buttons.
+
+Background: v0.2.12 introduced 42 button entities (21 pause + 21 resume,
+one pair per connected device). The feature is rarely used — the router's
+own web UI handles this better, and the buttons didn't generate unique
+IDs that coexisted cleanly with the v0.2.13 device_tracker changes
+(unique_id collision warnings in the HA log).
+
+If you actually need to pause a device's internet access from HA, use
+the integration's service call: hitron_coda_5610q.pause_device.
 """
 from __future__ import annotations
-
-from homeassistant.components.button import ButtonEntity, ButtonEntityDescription
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
-
-from .const import DOMAIN
-from .coordinator import HitronCodaCoordinator
-
-
-async def async_setup_entry(
-    hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
-) -> None:
-    """Set up button entities for each connected device."""
-    coordinator: HitronCodaCoordinator = hass.data[DOMAIN][entry.entry_id]
-
-    buttons: list[ButtonEntity] = []
-    for device in coordinator.data.devices:
-        # Pause button
-        buttons.append(
-            HitronDeviceButton(
-                coordinator,
-                ButtonEntityDescription(
-                    key=f"pause_{device.mac_address}",
-                    name=f"Pause {device.hostname}",
-                    icon="mdi:pause",
-                ),
-                device.mac_address,
-                action="pause",
-            )
-        )
-        # Resume button
-        buttons.append(
-            HitronDeviceButton(
-                coordinator,
-                ButtonEntityDescription(
-                    key=f"resume_{device.mac_address}",
-                    name=f"Resume {device.hostname}",
-                    icon="mdi:play",
-                ),
-                device.mac_address,
-                action="resume",
-            )
-        )
-
-    async_add_entities(buttons)
-
-
-class HitronDeviceButton(
-    CoordinatorEntity[HitronCodaCoordinator], ButtonEntity
-):
-    """A button to pause/resume a device."""
-
-    entity_description: ButtonEntityDescription
-
-    def __init__(
-        self,
-        coordinator: HitronCodaCoordinator,
-        description: ButtonEntityDescription,
-        mac_address: str,
-        action: str,
-    ) -> None:
-        super().__init__(coordinator)
-        self.entity_description = description
-        self._mac_address = mac_address
-        self._action = action
-        self._attr_unique_id = f"{DOMAIN}_{description.key}"
-
-    @property
-    def _hostname(self) -> str:
-        for d in self.coordinator.data.devices:
-            if d.mac_address == self._mac_address:
-                return d.hostname or d.mac_address
-        return self._mac_address
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        # Pause/resume buttons are tied to a specific LAN device, not
-        # to the router. Group them under the same DeviceInfo as the
-        # device_tracker for that MAC so they show up in the device's
-        # own card in the UI, not under "Hitron CODA-5610Q".
-        return DeviceInfo(
-            identifiers={(DOMAIN, self._mac_address)},
-            connections={("mac", self._mac_address)},
-            name=self._hostname,
-            via_device=(
-                DOMAIN,
-                self.coordinator.data.system_info.serial_number,
-            ),
-        )
-
-    @property
-    def available(self) -> bool:
-        """Available only if the device is currently in the device list."""
-        return any(
-            d.mac_address == self._mac_address for d in self.coordinator.data.devices
-        )
-
-    async def async_press(self) -> None:
-        """Press the button — pause or resume the device."""
-        if self._action == "pause":
-            await self.coordinator.api.pause_device(self._mac_address)
-        else:
-            await self.coordinator.api.resume_device(self._mac_address)
-        await self.coordinator.async_request_refresh()

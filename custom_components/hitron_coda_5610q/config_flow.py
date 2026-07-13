@@ -6,15 +6,28 @@ from typing import Any
 
 import aiohttp
 import voluptuous as vol
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
 from homeassistant.helpers.selector import (
+    BooleanSelector,
     TextSelector,
     TextSelectorConfig,
     TextSelectorType,
 )
 
 from .api import HitronAuthError, HitronConnectionError, HitronCodaAPI
-from .const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME, DEFAULT_USERNAME, DOMAIN
+from .const import (
+    CONF_EXPOSE_DIAGNOSTICS,
+    CONF_HOST,
+    CONF_PASSWORD,
+    CONF_USERNAME,
+    DEFAULT_USERNAME,
+    DOMAIN,
+)
 
 STEP_USER_DATA_SCHEMA = vol.Schema(
     {
@@ -73,4 +86,46 @@ class HitronCodaConfigFlow(ConfigFlow, domain=DOMAIN):
             step_id="user",
             data_schema=STEP_USER_DATA_SCHEMA,
             errors=errors,
+        )
+
+    @staticmethod
+    def async_get_options_flow(
+        config_entry: ConfigEntry,
+    ) -> "HitronCodaOptionsFlow":
+        """Return the options flow handler."""
+        return HitronCodaOptionsFlow(config_entry)
+
+
+class HitronCodaOptionsFlow(OptionsFlow):
+    """Handle options for Hitron CODA-5610Q.
+
+    v0.2.14: only one option right now — expose_diagnostics. When True,
+    the per-channel DOCSIS power/SNR sensors are created. Default False.
+    """
+
+    def __init__(self, config_entry: ConfigEntry) -> None:
+        """Store the config entry so we can read its current options."""
+        # ``OptionsFlow`` already exposes a `config_entry` property, so
+        # use a private attribute to avoid clobbering it.
+        self._entry = config_entry
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage the options."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(
+                        CONF_EXPOSE_DIAGNOSTICS,
+                        default=self._entry.options.get(
+                            CONF_EXPOSE_DIAGNOSTICS, False
+                        ),
+                    ): BooleanSelector(),
+                }
+            ),
         )

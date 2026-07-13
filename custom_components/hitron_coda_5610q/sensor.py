@@ -1,7 +1,9 @@
 """Sensors for the Hitron CODA-5610Q.
 
-Exposes DOCSIS diagnostics (downstream SNR/power, upstream power),
-router system stats (WAN/LAN uptime, traffic), and device count.
+Exposes router system stats (WAN/LAN uptime, traffic) and device count
+by default. The per-channel DOCSIS power/SNR sensors are opt-in via the
+``CONF_EXPOSE_DIAGNOSTICS`` config option (default off) — they make
+the entity registry noisy on a healthy cable plant (32+ entities).
 """
 from __future__ import annotations
 
@@ -22,7 +24,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import StateType
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, MANUFACTURER, MODEL
+from .const import CONF_EXPOSE_DIAGNOSTICS, DOMAIN, MANUFACTURER, MODEL
 from .coordinator import HitronCodaCoordinator
 
 
@@ -116,6 +118,14 @@ ROUTER_SENSORS: tuple[HitronSensorEntityDescription, ...] = (
 )
 
 
+# SignalToNoiseRatio isn't in older HA versions — use a string fallback
+try:
+    from homeassistant.components.sensor import SensorDeviceClass
+    SignalToNoiseRatio = SensorDeviceClass.SIGNAL_STRENGTH
+except AttributeError:
+    SignalToNoiseRatio = None
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -124,72 +134,68 @@ async def async_setup_entry(
     """Set up sensor entities."""
     coordinator: HitronCodaCoordinator = hass.data[DOMAIN][entry.entry_id]
 
-    # Router-level sensors
+    # Router-level sensors — always created
     entities: list[SensorEntity] = [
         HitronRouterSensor(coordinator, desc) for desc in ROUTER_SENSORS
     ]
 
-    # Per-downstream-channel sensors (SNR, power)
-    for i, channel in enumerate(coordinator.data.downstream_channels):
-        entities.append(
-            HitronDownstreamSensor(
-                coordinator,
-                HitronSensorEntityDescription(
-                    key=f"ds_{channel.channel_id}_snr",
-                    name=f"DS Channel {channel.channel_id} SNR",
-                    native_unit_of_measurement="dB",
-                    device_class=SignalToNoiseRatio,
-                    state_class=SensorStateClass.MEASUREMENT,
-                    entity_category=EntityCategory.DIAGNOSTIC,
-                    icon="mdi:signal-variant",
-                ),
-                channel_index=i,
-                attr="snr",
+    # v0.2.14: per-channel DOCSIS power/SNR sensors are opt-in.
+    # Default off — a healthy cable plant has 16+ DS channels, each with
+    # power and SNR, so this is 32+ entities. Users who need to
+    # diagnose cable plant issues can flip the option in the integration
+    # config (the integrations panel exposes it as a checkbox).
+    if entry.options.get(CONF_EXPOSE_DIAGNOSTICS, False):
+        for i, channel in enumerate(coordinator.data.downstream_channels):
+            entities.append(
+                HitronDownstreamSensor(
+                    coordinator,
+                    HitronSensorEntityDescription(
+                        key=f"ds_{channel.channel_id}_snr",
+                        name=f"DS Channel {channel.channel_id} SNR",
+                        native_unit_of_measurement="dB",
+                        device_class=SignalToNoiseRatio,
+                        state_class=SensorStateClass.MEASUREMENT,
+                        entity_category=EntityCategory.DIAGNOSTIC,
+                        icon="mdi:signal-variant",
+                    ),
+                    channel_index=i,
+                    attr="snr",
+                )
             )
-        )
-        entities.append(
-            HitronDownstreamSensor(
-                coordinator,
-                HitronSensorEntityDescription(
-                    key=f"ds_{channel.channel_id}_power",
-                    name=f"DS Channel {channel.channel_id} Power",
-                    native_unit_of_measurement="dBmV",
-                    state_class=SensorStateClass.MEASUREMENT,
-                    entity_category=EntityCategory.DIAGNOSTIC,
-                    icon="mdi:flash",
-                ),
-                channel_index=i,
-                attr="signal_strength",
+            entities.append(
+                HitronDownstreamSensor(
+                    coordinator,
+                    HitronSensorEntityDescription(
+                        key=f"ds_{channel.channel_id}_power",
+                        name=f"DS Channel {channel.channel_id} Power",
+                        native_unit_of_measurement="dBmV",
+                        state_class=SensorStateClass.MEASUREMENT,
+                        entity_category=EntityCategory.DIAGNOSTIC,
+                        icon="mdi:flash",
+                    ),
+                    channel_index=i,
+                    attr="signal_strength",
+                )
             )
-        )
 
-    # Per-upstream-channel sensors (power)
-    for i, channel in enumerate(coordinator.data.upstream_channels):
-        entities.append(
-            HitronUpstreamSensor(
-                coordinator,
-                HitronSensorEntityDescription(
-                    key=f"us_{channel.channel_id}_power",
-                    name=f"US Channel {channel.channel_id} Power",
-                    native_unit_of_measurement="dBmV",
-                    state_class=SensorStateClass.MEASUREMENT,
-                    entity_category=EntityCategory.DIAGNOSTIC,
-                    icon="mdi:flash",
-                ),
-                channel_index=i,
-                attr="signal_strength",
+        for i, channel in enumerate(coordinator.data.upstream_channels):
+            entities.append(
+                HitronUpstreamSensor(
+                    coordinator,
+                    HitronSensorEntityDescription(
+                        key=f"us_{channel.channel_id}_power",
+                        name=f"US Channel {channel.channel_id} Power",
+                        native_unit_of_measurement="dBmV",
+                        state_class=SensorStateClass.MEASUREMENT,
+                        entity_category=EntityCategory.DIAGNOSTIC,
+                        icon="mdi:flash",
+                    ),
+                    channel_index=i,
+                    attr="signal_strength",
+                )
             )
-        )
 
     async_add_entities(entities)
-
-
-# SignalToNoiseRatio isn't in older HA versions — use a string fallback
-try:
-    from homeassistant.components.sensor import SensorDeviceClass
-    SignalToNoiseRatio = SensorDeviceClass.SIGNAL_STRENGTH
-except AttributeError:
-    SignalToNoiseRatio = None
 
 
 class HitronRouterSensor(CoordinatorEntity[HitronCodaCoordinator], SensorEntity):

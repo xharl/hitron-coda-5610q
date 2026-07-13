@@ -12,8 +12,9 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 
 from .api import HitronCodaAPI
-from .const import DEFAULT_SCAN_INTERVAL, DOMAIN
+from .const import DEFAULT_SCAN_INTERVAL, DOMAIN, SERVICE_MIGRATE_TO_V0_2_13
 from .coordinator import HitronCodaCoordinator
+from .device_tracker import register_services as _register_dt_services
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -60,6 +61,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.warning("hitron_coda_5610q: first refresh OK")
 
         hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+
+        # v0.2.13: register the one-shot migration service once per
+        # integration load. The service walks the entity_registry and
+        # renames MAC-keyed device_tracker unique_ids to hostname-keyed
+        # ones, then reloads the config entry.
+        _register_dt_services(hass)
 
         _LOGGER.warning("hitron_coda_5610q: forwarding setups to %s", PLATFORMS)
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

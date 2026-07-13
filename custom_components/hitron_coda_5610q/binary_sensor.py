@@ -1,6 +1,11 @@
 """Binary sensors for the Hitron CODA-5610Q.
 
-Exposes DOCSIS provisioning steps, firewall status, and WiFi radio status.
+v0.2.14: dropped the 7 DOCSIS provisioning step sensors. They were always
+on during normal operation and unreachable when the modem was down, so
+they were pure noise.
+
+Exposes firewall status, network access, WiFi radio status, and
+Ethernet port link state.
 """
 from __future__ import annotations
 
@@ -17,16 +22,6 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN, MANUFACTURER, MODEL
 from .coordinator import HitronCodaCoordinator
 
-DOCSIS_STEPS = (
-    "hwInit",
-    "findDownstream",
-    "ranging",
-    "dhcp",
-    "timeOfday",
-    "downloadCfg",
-    "registration",
-)
-
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -36,24 +31,8 @@ async def async_setup_entry(
     """Set up binary sensor entities."""
     coordinator: HitronCodaCoordinator = hass.data[DOMAIN][entry.entry_id]
 
-    entities: list[BinarySensorEntity] = []
-
-    # DOCSIS provisioning steps
-    for step in DOCSIS_STEPS:
-        entities.append(
-            HitronDocsisStepSensor(
-                coordinator,
-                BinarySensorEntityDescription(
-                    key=f"docsis_{step}",
-                    name=f"DOCSIS {step.replace('_', ' ').title()}",
-                    icon="mdi:check-network",
-                ),
-                step,
-            )
-        )
-
-    # Network access permitted
-    entities.append(
+    entities: list[BinarySensorEntity] = [
+        # Network access permitted
         HitronBinarySensor(
             coordinator,
             BinarySensorEntityDescription(
@@ -62,11 +41,8 @@ async def async_setup_entry(
                 icon="mdi:lock-open-check",
             ),
             lambda data: data.docsis_provisioning.get("networkAccess") == "Permitted",
-        )
-    )
-
-    # Firewall enabled
-    entities.append(
+        ),
+        # Firewall enabled
         HitronBinarySensor(
             coordinator,
             BinarySensorEntityDescription(
@@ -75,8 +51,8 @@ async def async_setup_entry(
                 icon="mdi:shield-check",
             ),
             lambda data: data.firewall_status.get("fw_status") == "Enable",
-        )
-    )
+        ),
+    ]
 
     # WiFi radio on/off per band
     for radio in coordinator.data.wifi_radios:
@@ -146,33 +122,3 @@ class HitronBinarySensor(
     @property
     def is_on(self) -> bool:
         return bool(self._value_fn(self.coordinator.data))
-
-
-class HitronDocsisStepSensor(
-    CoordinatorEntity[HitronCodaCoordinator], BinarySensorEntity
-):
-    """DOCSIS provisioning step status (Success = on)."""
-
-    def __init__(
-        self,
-        coordinator: HitronCodaCoordinator,
-        description: BinarySensorEntityDescription,
-        step: str,
-    ) -> None:
-        super().__init__(coordinator)
-        self.entity_description = description
-        self._attr_unique_id = f"{DOMAIN}_{description.key}"
-        self._step = step
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        return DeviceInfo(
-            identifiers={(DOMAIN, self.coordinator.data.system_info.serial_number)},
-            manufacturer=MANUFACTURER,
-            model=MODEL,
-            name="Hitron CODA-5610Q",
-        )
-
-    @property
-    def is_on(self) -> bool:
-        return self.coordinator.data.docsis_provisioning.get(self._step) == "Success"
