@@ -95,6 +95,72 @@ async def test_unique_id_includes_mac():
     assert tracker.unique_id == f"{DOMAIN}_{mac}"
 
 
+async def test_device_info_creates_per_device_device_entry():
+    """Each tracked LAN device should be its own HA device (identified by
+    its MAC) with the router as via_device — NOT collapsed under a
+    single 'Hitron CODA-5610Q' device.
+
+    Regression for v0.2.12: all 21 device_tracker entities were sharing
+    the same DeviceInfo.identifiers set, so HA collapsed them under one
+    device with the same name. The fix uses each device's MAC as the
+    identifier and via_device=(DOMAIN, router_serial).
+    """
+    mac_a = "AA:BB:CC:DD:EE:01"
+    mac_b = "AA:BB:CC:DD:EE:02"
+    coord = _make_coordinator([
+        _device(mac_a, status=True, hostname="kitchen-laptop"),
+        _device(mac_b, status=True, hostname="office-printer"),
+    ])
+    tracker_a = HitronCodaDeviceTracker(coord, mac_a)
+    tracker_b = HitronCodaDeviceTracker(coord, mac_b)
+
+    info_a = tracker_a.device_info
+    info_b = tracker_b.device_info
+
+    # Each tracker has its own identifier (its MAC) — they're not
+    # collapsed into a single device. (DeviceInfo is a TypedDict at
+    # runtime, so use [] access, not attribute access.)
+    assert info_a["identifiers"] == {(DOMAIN, mac_a)}
+    assert info_b["identifiers"] == {(DOMAIN, mac_b)}
+    assert info_a["identifiers"] != info_b["identifiers"]
+
+    # Each has a mac connection (so HA's device registry can dedupe by
+    # MAC if the same device shows up via another integration).
+    assert ("mac", mac_a) in info_a["connections"]
+    assert ("mac", mac_b) in info_b["connections"]
+
+    # Each names itself after the LAN device's hostname.
+    assert info_a["name"] == "kitchen-laptop"
+    assert info_b["name"] == "office-printer"
+
+    # Both are children of the router device, not standalone.
+    router_serial = coord.data.system_info.serial_number
+    assert info_a["via_device"] == (DOMAIN, router_serial)
+    assert info_b["via_device"] == (DOMAIN, router_serial)
+
+
+async def test_device_info_falls_back_to_mac_when_no_hostname():
+    """Devices without a hostname (the router returned an empty string)
+    should still get a meaningful device name — fall back to the MAC."""
+    mac = "AA:BB:CC:DD:EE:FF"
+    # Construct a device with empty hostname
+    device = ConnectedDevice(
+        hostname="",  # router returned empty
+        ip_address="192.168.0.10",
+        mac_address=mac,
+        interface="WiFi 2.4G",
+        address_source="DHCP-IP",
+        status=True,
+        action="Resume",
+    )
+    coord = _make_coordinator([device])
+    tracker = HitronCodaDeviceTracker(coord, mac)
+    assert tracker.device_info["name"] == mac  # fell back to MAC
+    # But _hostname (the property used by the device name) returns the
+    # MAC when the hostname is empty.
+    assert tracker._hostname == mac
+
+
 async def test_extra_state_attributes_includes_wifi_info():
     """The extra_state_attributes should pull RSSI/SSID/etc from wifi_clients
     when the device is a WiFi client."""

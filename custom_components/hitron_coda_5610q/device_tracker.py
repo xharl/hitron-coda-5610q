@@ -9,7 +9,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, MANUFACTURER, MODEL
+from .const import DOMAIN
 from .coordinator import HitronCodaCoordinator
 
 
@@ -38,15 +38,42 @@ class HitronCodaDeviceTracker(CoordinatorEntity[HitronCodaCoordinator], TrackerE
         self._attr_unique_id = f"{DOMAIN}_{mac}"
 
     @property
+    def _hostname(self) -> str:
+        for d in self.coordinator.data.devices:
+            if d.mac_address == self._mac:
+                return d.hostname or d.mac_address
+        return self._mac
+
+    @property
     def device_info(self) -> DeviceInfo:
+        # Each tracked LAN device is its own HA device, identified by
+        # its MAC address, with the router as the parent via via_device.
+        # This way, "kitchen-laptop" appears as its own device in the
+        # device registry with a sensible name, instead of all 21
+        # trackers being collapsed under a single "Hitron CODA-5610Q"
+        # device. The router itself (the one created by sensor.py
+        # / binary_sensor.py) is the parent — identifiable by its
+        # serial number.
         return DeviceInfo(
-            identifiers={(DOMAIN, self.coordinator.data.system_info.serial_number)},
-            manufacturer=MANUFACTURER,
-            model=MODEL,
-            name="Hitron CODA-5610Q",
-            sw_version=self.coordinator.data.system_info.software_version,
-            hw_version=self.coordinator.data.system_info.hardware_version,
+            identifiers={(DOMAIN, self._mac)},
+            connections={("mac", self._mac)},
+            manufacturer="Unknown",  # router doesn't expose device vendor
+            model="LAN device",
+            name=self._hostname,
+            via_device=(
+                DOMAIN,
+                self.coordinator.data.system_info.serial_number,
+            ),
         )
+
+    @property
+    def name(self) -> str | None:
+        # Override the default name (None means "use device name") to
+        # something like "kitchen-laptop" instead of "Hitron CODA-5610Q".
+        # _attr_has_entity_name is True so the entity will be named
+        # "<device name> <entity name>" — but with entity name = None
+        # and a meaningful device name, the user sees a useful label.
+        return None
 
     @property
     def state(self) -> str:

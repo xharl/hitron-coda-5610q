@@ -11,7 +11,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, MANUFACTURER, MODEL
+from .const import DOMAIN
 from .coordinator import HitronCodaCoordinator
 
 
@@ -76,12 +76,26 @@ class HitronDeviceButton(
         self._attr_unique_id = f"{DOMAIN}_{description.key}"
 
     @property
+    def _hostname(self) -> str:
+        for d in self.coordinator.data.devices:
+            if d.mac_address == self._mac_address:
+                return d.hostname or d.mac_address
+        return self._mac_address
+
+    @property
     def device_info(self) -> DeviceInfo:
+        # Pause/resume buttons are tied to a specific LAN device, not
+        # to the router. Group them under the same DeviceInfo as the
+        # device_tracker for that MAC so they show up in the device's
+        # own card in the UI, not under "Hitron CODA-5610Q".
         return DeviceInfo(
-            identifiers={(DOMAIN, self.coordinator.data.system_info.serial_number)},
-            manufacturer=MANUFACTURER,
-            model=MODEL,
-            name="Hitron CODA-5610Q",
+            identifiers={(DOMAIN, self._mac_address)},
+            connections={("mac", self._mac_address)},
+            name=self._hostname,
+            via_device=(
+                DOMAIN,
+                self.coordinator.data.system_info.serial_number,
+            ),
         )
 
     @property

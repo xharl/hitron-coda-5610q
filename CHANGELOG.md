@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.12 — 2026-07-13
+
+### Fixed
+- **All 21 device_tracker entities were collapsed under a single device
+  named "Hitron CODA-5610Q"** because they all returned the same
+  `DeviceInfo.identifiers={(DOMAIN, router_serial)}`. Each LAN device
+  is now its own HA device, identified by its MAC address, with the
+  router as the parent via `via_device=(DOMAIN, router_serial)`. The
+  device name is the LAN device's hostname (falling back to the MAC
+  if the router didn't report a hostname). The corresponding
+  pause/resume buttons in `button.py` are now grouped under the same
+  per-device identifier so they show up in the device's own card
+  in the UI.
+
 ## 0.2.11 — 2026-07-13
 
 ### Fixed
