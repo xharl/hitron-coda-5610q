@@ -1,11 +1,12 @@
 """Config flow for Hitron CODA-5610Q."""
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
+import aiohttp
 import voluptuous as vol
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
     TextSelector,
     TextSelectorConfig,
@@ -39,29 +40,34 @@ class HitronCodaConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            session = async_get_clientsession(self.hass)
-            api = HitronCodaAPI(
-                session,
-                user_input[CONF_HOST],
-                user_input[CONF_USERNAME],
-                user_input[CONF_PASSWORD],
-            )
+            # Use a fresh session to avoid cookie-jar interference from
+            # HA's shared session (see __init__.py for details).
+            session = aiohttp.ClientSession()
             try:
-                await api.login()
-                info = await api.get_system_info()
-            except HitronAuthError:
-                errors["base"] = "invalid_auth"
-            except HitronConnectionError:
-                errors["base"] = "cannot_connect"
-            else:
-                # Use the serial number as the unique id. ``info`` is a
-                # SystemInfo dataclass (not a dict), so use attribute access.
-                await self.async_set_unique_id(info.serial_number)
-                self._abort_if_unique_id_configured()
-                return self.async_create_entry(
-                    title=f"Hitron CODA-5610Q ({user_input[CONF_HOST]})",
-                    data=user_input,
+                api = HitronCodaAPI(
+                    session,
+                    user_input[CONF_HOST],
+                    user_input[CONF_USERNAME],
+                    user_input[CONF_PASSWORD],
                 )
+                try:
+                    await api.login()
+                    info = await api.get_system_info()
+                except HitronAuthError:
+                    errors["base"] = "invalid_auth"
+                except HitronConnectionError:
+                    errors["base"] = "cannot_connect"
+                else:
+                    # Use the serial number as the unique id. ``info`` is a
+                    # SystemInfo dataclass (not a dict), so use attribute access.
+                    await self.async_set_unique_id(info.serial_number)
+                    self._abort_if_unique_id_configured()
+                    return self.async_create_entry(
+                        title=f"Hitron CODA-5610Q ({user_input[CONF_HOST]})",
+                        data=user_input,
+                    )
+            finally:
+                await session.close()
 
         return self.async_show_form(
             step_id="user",

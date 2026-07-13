@@ -1,13 +1,15 @@
 """The Hitron CODA-5610Q integration."""
 from __future__ import annotations
 
+import asyncio
 import logging
+
+import aiohttp
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_SCAN_INTERVAL, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import HitronCodaAPI
 from .const import DEFAULT_SCAN_INTERVAL, DOMAIN
@@ -33,8 +35,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry.entry_id,
         list(entry.data.keys()),
     )
+    # Use a fresh aiohttp.ClientSession per entry instead of HA's shared
+    # session. The shared session (from async_get_clientsession) merges
+    # cookies from other integrations and HA's own state, which can
+    # cause the router to return an HTML login page instead of JSON
+    # when our PHPSESSID is sent alongside stale session cookies.
+    session = aiohttp.ClientSession()
     try:
-        session = async_get_clientsession(hass)
         api = HitronCodaAPI(
             session,
             entry.data["host"],
@@ -59,8 +66,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.warning("hitron_coda_5610q: forwards OK")
 
         entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+
+        # Close the session when the entry is unloaded
+        async def _close_session(event):
+            await session.close()
+        entry.async_on_unload(
+            hass.bus.async_listen_once(
+                f"homeassistant_close", _close_session
+            )
+        )
         return True
     except Exception as err:
+        await session.close()
         _LOGGER.exception("hitron_coda_5610q.async_setup_entry FAILED: %s", err)
         raise
 

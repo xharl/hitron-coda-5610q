@@ -4,11 +4,17 @@ Regression for v0.2.2 → v0.2.3: the config flow used
 ``info["SerialNum"]`` (dict access) but ``get_system_info()`` returns
 a ``SystemInfo`` dataclass, so every successful login crashed with
 ``TypeError: 'SystemInfo' object is not subscriptable`` and HA showed
-"Unknown error". This test exercises the real flow handler with
-realistic router response payloads and asserts the config entry is
-created with the right unique id (the serial number).
+"Unknown error".
+
+Also regression for v0.2.5: the config flow now creates its own
+aiohttp.ClientSession (to avoid cookie-jar interference from HA's
+shared session). The tests build a complete session mock and use
+``patch("aiohttp.ClientSession")`` to inject it.
 """
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import aiohttp
+import pytest
 
 from custom_components.hitron_coda_5610q.config_flow import (
     HitronCodaConfigFlow,
@@ -56,12 +62,28 @@ def _make_session(login_payload, version_payload):
 
     session.post = _post
     session.get = _get
+    # session.close() is an async no-op
+    async def _close():
+        return None
+    session.close = _close
     return session
 
 
-def _patch_session(hass, session):
-    from custom_components.hitron_coda_5610q import config_flow as cf_mod
-    cf_mod.async_get_clientsession = lambda hass: session
+def _make_session_raising(exception):
+    """Build a mock session whose post() raises the given exception."""
+    session = MagicMock()
+
+    class _TimeoutCM:
+        async def __aenter__(self):
+            raise exception
+        async def __aexit__(self, *args):
+            return False
+
+    session.post = lambda url, data=None: _TimeoutCM()
+    async def _close():
+        return None
+    session.close = _close
+    return session
 
 
 async def test_config_flow_succeeds(hass):
@@ -79,15 +101,14 @@ async def test_config_flow_succeeds(hass):
         "DeploymentName": "VIDEOTRON",
         "wifiChip": "qca",
     }
-    _patch_session(hass, _make_session(login_payload, version_payload))
-
-    flow = HitronCodaConfigFlow()
-    flow.hass = hass
-    flow.context = {"source": "user"}
-
-    result = await flow.async_step_user(
-        {CONF_HOST: HOST, CONF_USERNAME: "cusadmin", CONF_PASSWORD: "password"}
-    )
+    session = _make_session(login_payload, version_payload)
+    with patch("aiohttp.ClientSession", return_value=session):
+        flow = HitronCodaConfigFlow()
+        flow.hass = hass
+        flow.context = {"source": "user"}
+        result = await flow.async_step_user(
+            {CONF_HOST: HOST, CONF_USERNAME: "cusadmin", CONF_PASSWORD: "password"}
+        )
 
     assert result["type"] == "create_entry", result
     assert result["title"] == f"Hitron CODA-5610Q ({HOST})"
@@ -100,44 +121,31 @@ async def test_config_flow_wrong_password_shows_invalid_auth(hass):
     """Wrong password returns the form with invalid_auth error, no crash."""
     login_payload = {"errCode": "000", "errMsg": "", "result": "Error_Password_Wrong"}
     version_payload = {"errCode": "001", "errMsg": "no auth"}
-    _patch_session(hass, _make_session(login_payload, version_payload))
-
-    flow = HitronCodaConfigFlow()
-    flow.hass = hass
-    flow.context = {"source": "user"}
-
-    result = await flow.async_step_user(
-        {CONF_HOST: HOST, CONF_USERNAME: "cusadmin", CONF_PASSWORD: "wrong"}
-    )
+    session = _make_session(login_payload, version_payload)
+    with patch("aiohttp.ClientSession", return_value=session):
+        flow = HitronCodaConfigFlow()
+        flow.hass = hass
+        flow.context = {"source": "user"}
+        result = await flow.async_step_user(
+            {CONF_HOST: HOST, CONF_USERNAME: "cusadmin", CONF_PASSWORD: "wrong"}
+        )
 
     assert result["type"] == "form"
     assert result["errors"] == {"base": "invalid_auth"}
-    # Unique id should not have been set on failure
     assert getattr(flow, "unique_id", None) is None
 
 
 async def test_config_flow_unreachable_host_shows_cannot_connect(hass):
     """Unreachable host: aiohttp ConnectionTimeoutError must surface as
     HitronConnectionError, then the config flow renders cannot_connect."""
-    session = MagicMock()
-
-    class _TimeoutCM:
-        async def __aenter__(self):
-            import aiohttp
-            raise aiohttp.ConnectionTimeoutError("timeout")
-        async def __aexit__(self, *args):
-            return False
-
-    session.post = lambda url, data=None: _TimeoutCM()
-    _patch_session(hass, session)
-
-    flow = HitronCodaConfigFlow()
-    flow.hass = hass
-    flow.context = {"source": "user"}
-
-    result = await flow.async_step_user(
-        {CONF_HOST: "192.168.99.99", CONF_USERNAME: "cusadmin", CONF_PASSWORD: "x"}
-    )
+    session = _make_session_raising(aiohttp.ConnectionTimeoutError("timeout"))
+    with patch("aiohttp.ClientSession", return_value=session):
+        flow = HitronCodaConfigFlow()
+        flow.hass = hass
+        flow.context = {"source": "user"}
+        result = await flow.async_step_user(
+            {CONF_HOST: "192.168.99.99", CONF_USERNAME: "cusadmin", CONF_PASSWORD: "x"}
+        )
 
     assert result["type"] == "form"
     assert result["errors"] == {"base": "cannot_connect"}

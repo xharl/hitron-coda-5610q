@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.5 — 2026-07-13
+
+### Fixed
+- **Integration created config entry but no entities ever appeared** — the
+  coordinator's first refresh failed because the shared HA `aiohttp.ClientSession`
+  (from `async_get_clientsession`) has a cookie jar that interferes with our
+  PHPSESSID cookie, causing the router to return the HTML login page instead of
+  JSON for the GET endpoints. Switched to creating a fresh `aiohttp.ClientSession`
+  per config entry (and per config-flow attempt). This is a known pattern for
+  integrations that have their own authentication and need cookie isolation.
+
 ## 0.2.4 — 2026-07-13
 
 ### Changed
