@@ -1,14 +1,13 @@
 """Test the API client."""
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from custom_components.hitron_coda_5610q.api import (
     ConnectedDevice,
     HitronAuthError,
-    HitronConnectionError,
     HitronCodaAPI,
     SystemInfo,
 )
@@ -22,86 +21,58 @@ def load_fixture(name: str) -> dict:
     return json.loads(fixture_path.read_text())
 
 
-def _mock_response(data: dict, status: int = 200, cookies: dict | None = None):
-    """Create a mock aiohttp response."""
-    resp = MagicMock()
-    resp.status = status
-    resp.json = AsyncMock(return_value=data)
-    return resp
+class MockResponse:
+    """Mock aiohttp response that supports async context manager."""
+
+    def __init__(self, data: dict, status: int = 200):
+        self.status = status
+        self._data = data
+
+    async def json(self, content_type=None):
+        return self._data
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
 
 
-def _mock_session(cookie_jar_cookies: dict | None = None):
+def _make_session(login_ok=True, hosts_data=None, version_data=None):
     """Create a mock aiohttp ClientSession."""
     session = MagicMock()
+
+    # Cookie jar
     session.cookie_jar = []
+    if login_ok:
+        cookie = MagicMock()
+        cookie.key = "PHPSESSID"
+        cookie.value = "abc123"
+        session.cookie_jar.append(cookie)
 
-    if cookie_jar_cookies:
-        for key, val in cookie_jar_cookies.items():
-            cookie = MagicMock()
-            cookie.key = key
-            cookie.value = val
-            session.cookie_jar.append(cookie)
-
-    async def _post(url, data=None):
+    def _post(url, data=None):
         if "Login" in str(url):
-            return _mock_response(
-                {"errCode": "000", "result": "success"},
-                cookies={"PHPSESSID": "abc123"},
-            )
-        return _mock_response({"errCode": "001", "errMsg": "not found"})
+            if login_ok:
+                return MockResponse({"errCode": "000", "result": "success"})
+            return MockResponse({"errCode": "001", "errMsg": "Invalid username or password."})
+        return MockResponse({"errCode": "001", "errMsg": "not found"})
 
-    async def _get(url, cookies=None, headers=None):
-        if "Hosts/1" in str(url):
-            return _mock_response(load_fixture("connect_info.json"))
-        if "CM/Version" in str(url):
-            return _mock_response(
-                {
-                    "errCode": "000",
-                    "deviceId": "38:AD:2B:93:19:20",
-                    "modelName": "CODA5610Q",
-                    "ApiVersion": "1.12.1",
-                    "SoftwareVersion": "7.3.5.1.2b22",
-                    "SerialNum": "AN6025101226",
-                    "HwVersion": "1A",
-                    "vendorName": "Hitron Technologies",
-                    "DeploymentName": "VIDEOTRON",
-                    "wifiChip": "qca",
-                }
-            )
-        return _mock_response({"errCode": "001", "errMsg": "not found"})
+    def _get(url, cookies=None, headers=None):
+        url_str = str(url)
+        if "Hosts/1" in url_str:
+            return MockResponse(hosts_data or {"errCode": "001", "errMsg": "not found"})
+        if "CM/Version" in url_str:
+            return MockResponse(version_data or {"errCode": "001", "errMsg": "not found"})
+        return MockResponse({"errCode": "001", "errMsg": "not found"})
 
-    # Make post/get context managers
-    class _Ctx:
-        def __init__(self, resp):
-            self._resp = resp
-
-        async def __aenter__(self):
-            return self._resp
-
-        async def __aexit__(self, *args):
-            pass
-
-    async def _post_cm(url, data=None):
-        return _Ctx(await _post(url, data))
-
-    async def _get_cm(url, cookies=None, headers=None):
-        return _Ctx(await _get(url, cookies, headers))
-
-    session.post = _post_cm
-    session.get = _get_cm
-
+    session.post = _post
+    session.get = _get
     return session
 
 
 async def test_login_succeeds():
     """Test that login stores the PHPSESSID cookie."""
-    session = _mock_session()
-    # After login, the cookie jar should have PHPSESSID
-    cookie = MagicMock()
-    cookie.key = "PHPSESSID"
-    cookie.value = "abc123"
-    session.cookie_jar.append(cookie)
-
+    session = _make_session(login_ok=True)
     api = HitronCodaAPI(session, HOST, "cusadmin", "password")
     await api.login()
     assert "PHPSESSID" in api._cookies
@@ -110,19 +81,7 @@ async def test_login_succeeds():
 
 async def test_login_fails_invalid_credentials():
     """Test that invalid credentials raise HitronAuthError."""
-    session = MagicMock()
-    resp = _mock_response({"errCode": "001", "errMsg": "Invalid username or password."})
-
-    class _Ctx:
-        async def __aenter__(self):
-            return resp
-
-        async def __aexit__(self, *args):
-            pass
-
-    session.post = AsyncMock(return_value=_Ctx())
-    session.cookie_jar = []
-
+    session = _make_session(login_ok=False)
     api = HitronCodaAPI(session, HOST, "cusadmin", "wrong")
     with pytest.raises(HitronAuthError):
         await api.login()
@@ -130,12 +89,19 @@ async def test_login_fails_invalid_credentials():
 
 async def test_get_system_info():
     """Test fetching system info."""
-    session = _mock_session()
-    cookie = MagicMock()
-    cookie.key = "PHPSESSID"
-    cookie.value = "abc123"
-    session.cookie_jar.append(cookie)
-
+    version_data = {
+        "errCode": "000",
+        "deviceId": "38:AD:2B:93:19:20",
+        "modelName": "CODA5610Q",
+        "ApiVersion": "1.12.1",
+        "SoftwareVersion": "7.3.5.1.2b22",
+        "SerialNum": "AN6025101226",
+        "HwVersion": "1A",
+        "vendorName": "Hitron Technologies",
+        "DeploymentName": "VIDEOTRON",
+        "wifiChip": "qca",
+    }
+    session = _make_session(login_ok=True, version_data=version_data)
     api = HitronCodaAPI(session, HOST, "cusadmin", "password")
     api._cookies = {"PHPSESSID": "abc123"}
     info = await api.get_system_info()
@@ -149,12 +115,7 @@ async def test_get_system_info():
 async def test_get_connected_devices():
     """Test fetching the connected device list with real fixture data."""
     fixture = load_fixture("connect_info.json")
-    session = _mock_session()
-    cookie = MagicMock()
-    cookie.key = "PHPSESSID"
-    cookie.value = "abc123"
-    session.cookie_jar.append(cookie)
-
+    session = _make_session(login_ok=True, hosts_data=fixture)
     api = HitronCodaAPI(session, HOST, "cusadmin", "password")
     api._cookies = {"PHPSESSID": "abc123"}
     devices = await api.get_connected_devices()
@@ -175,24 +136,10 @@ async def test_get_connected_devices():
 
 async def test_get_connected_devices_empty():
     """Test fetching devices when router returns empty list."""
-    session = MagicMock()
-    resp = _mock_response(
-        {"errCode": "000", "HostNumberOfEntries": "0", "Hosts_List": []}
+    session = _make_session(
+        login_ok=True,
+        hosts_data={"errCode": "000", "HostNumberOfEntries": "0", "Hosts_List": []},
     )
-
-    class _Ctx:
-        async def __aenter__(self):
-            return resp
-
-        async def __aexit__(self, *args):
-            pass
-
-    async def _get(url, cookies=None, headers=None):
-        return _Ctx()
-
-    session.get = _get
-    session.cookie_jar = []
-
     api = HitronCodaAPI(session, HOST, "cusadmin", "password")
     api._cookies = {"PHPSESSID": "abc123"}
     devices = await api.get_connected_devices()
