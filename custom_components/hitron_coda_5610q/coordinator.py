@@ -66,6 +66,17 @@ class HitronCodaCoordinator(DataUpdateCoordinator[HitronCodaData]):
         self.api = api
 
     async def _async_update_data(self) -> HitronCodaData:
+        # The CODA-5610Q's web server cannot reliably handle 12
+        # parallel requests — it returns empty/malformed bodies when
+        # overloaded. Use a semaphore to cap concurrency at 3, which
+        # empirically keeps the router happy. Combined with the retry
+        # logic in _request_json, this gives a near-100% success rate.
+        sem = asyncio.Semaphore(3)
+
+        async def _bounded(coro):
+            async with sem:
+                return await coro
+
         try:
             (
                 devices,
@@ -81,18 +92,18 @@ class HitronCodaCoordinator(DataUpdateCoordinator[HitronCodaData]):
                 firewall,
                 eth_ports,
             ) = await asyncio.gather(
-                self.api.get_connected_devices(),
-                self.api.get_system_info(),
-                self.api.get_router_sys_info(),
-                self.api.get_downstream_channels(),
-                self.api.get_upstream_channels(),
-                self.api.get_dhcp_reservations(),
-                self.api.get_wifi_clients(),
-                self.api.get_docsis_provisioning(),
-                self.api.get_cm_sys_info(),
-                self.api.get_wifi_radios(),
-                self.api.get_firewall_status(),
-                self.api.get_ethernet_ports(),
+                _bounded(self.api.get_connected_devices()),
+                _bounded(self.api.get_system_info()),
+                _bounded(self.api.get_router_sys_info()),
+                _bounded(self.api.get_downstream_channels()),
+                _bounded(self.api.get_upstream_channels()),
+                _bounded(self.api.get_dhcp_reservations()),
+                _bounded(self.api.get_wifi_clients()),
+                _bounded(self.api.get_docsis_provisioning()),
+                _bounded(self.api.get_cm_sys_info()),
+                _bounded(self.api.get_wifi_radios()),
+                _bounded(self.api.get_firewall_status()),
+                _bounded(self.api.get_ethernet_ports()),
             )
         except HitronAuthError as err:
             raise ConfigEntryAuthFailed(err) from err

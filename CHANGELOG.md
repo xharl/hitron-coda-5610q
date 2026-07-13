@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.7 — 2026-07-13
+
+### Fixed
+- **First refresh still failed intermittently with empty/malformed responses**
+  even with retry logic. The router can't handle 12 parallel requests
+  reliably, so the requests pile up and the router returns empty bodies
+  for many of them. Cap the parallel gather at 3 concurrent requests
+  (using `asyncio.Semaphore(3)`), which combined with the v0.2.6 retry
+  logic gives reliable first-refresh success.
+
 ## 0.2.6 — 2026-07-13
 
 ### Fixed
