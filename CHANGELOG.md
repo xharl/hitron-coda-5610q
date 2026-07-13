@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.1 — 2026-07-13
+
+### Fixed
+- **Config-flow login accepted wrong passwords as valid** (`HitronCodaAPI.login`).
+  The CODA-5610Q returns `{"errCode": "000", "result": "Error_Password_Wrong"}`
+  for bad credentials — `errCode` alone is not a reliable success indicator.
+  The fix also reads the `PHPSESSID` cookie from the response `Set-Cookie`
+  header instead of the session jar (which aiohttp does not populate for
+  `FormData` POSTs in the default configuration). Without this fix the
+  config flow would silently "succeed" login with any password and then
+  fail on the next request with a misleading "cannot connect" error.
+- Added regression test `test_login_fails_wrong_password_real_response`
+  using the actual router response shape.
+
 ## 0.2.0 — 2026-07-13
 
 ### Added

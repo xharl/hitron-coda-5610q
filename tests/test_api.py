@@ -24,9 +24,15 @@ def load_fixture(name: str) -> dict:
 class MockResponse:
     """Mock aiohttp response that supports async context manager."""
 
-    def __init__(self, data: dict, status: int = 200):
+    def __init__(self, data: dict, status: int = 200, set_cookie: str | None = None):
         self.status = status
         self._data = data
+        # Minimal CIMultiDict-like headers. Only getall() is exercised by the
+        # API client, so that's all we implement.
+        self.headers = MagicMock()
+        self.headers.getall = lambda name, default=[]: (
+            [set_cookie] if name.lower() == "set-cookie" and set_cookie else default
+        )
 
     async def json(self, content_type=None):
         return self._data
@@ -38,23 +44,36 @@ class MockResponse:
         pass
 
 
-def _make_session(login_ok=True, hosts_data=None, version_data=None):
-    """Create a mock aiohttp ClientSession."""
+def _make_session(
+    login_payload: dict | None = None,
+    hosts_data=None,
+    version_data=None,
+    set_cookie: str | None = "auto",
+):
+    """Create a mock aiohttp ClientSession.
+
+    ``login_payload`` is the JSON body returned by the Login endpoint.
+    Defaults to a real success response. Pass the real wrong-password
+    response shape ``{"errCode": "000", "errMsg": "", "result": "Error_Password_Wrong"}``
+    to exercise the auth-error path.
+
+    ``set_cookie`` controls the response's Set-Cookie header. ``"auto"``
+    (default) emits a PHPSESSID when ``login_payload`` indicates success
+    and ``None`` otherwise. Pass an explicit string to override (e.g.
+    ``None`` to test the "no cookie returned" case even on success).
+    """
     session = MagicMock()
 
-    # Cookie jar
-    session.cookie_jar = []
-    if login_ok:
-        cookie = MagicMock()
-        cookie.key = "PHPSESSID"
-        cookie.value = "abc123"
-        session.cookie_jar.append(cookie)
+    if login_payload is None:
+        login_payload = {"errCode": "000", "errMsg": "", "result": "success"}
+
+    if set_cookie == "auto":
+        is_success = login_payload.get("result") == "success"
+        set_cookie = "PHPSESSID=abc123; path=/; HttpOnly" if is_success else None
 
     def _post(url, data=None):
         if "Login" in str(url):
-            if login_ok:
-                return MockResponse({"errCode": "000", "result": "success"})
-            return MockResponse({"errCode": "001", "errMsg": "Invalid username or password."})
+            return MockResponse(login_payload, set_cookie=set_cookie)
         return MockResponse({"errCode": "001", "errMsg": "not found"})
 
     def _get(url, cookies=None, headers=None):
@@ -71,19 +90,53 @@ def _make_session(login_ok=True, hosts_data=None, version_data=None):
 
 
 async def test_login_succeeds():
-    """Test that login stores the PHPSESSID cookie."""
-    session = _make_session(login_ok=True)
+    """Test that login stores the PHPSESSID cookie from the response header."""
+    session = _make_session()
     api = HitronCodaAPI(session, HOST, "cusadmin", "password")
     await api.login()
     assert "PHPSESSID" in api._cookies
     assert api._cookies["PHPSESSID"] == "abc123"
 
 
-async def test_login_fails_invalid_credentials():
-    """Test that invalid credentials raise HitronAuthError."""
-    session = _make_session(login_ok=False)
+async def test_login_fails_wrong_password_real_response():
+    """Regression: the CODA-5610Q returns errCode='000' for wrong passwords.
+
+    The real router response is
+    ``{"errCode": "000", "errMsg": "", "result": "Error_Password_Wrong"}``
+    — errCode alone is not enough; ``result`` must also be checked.
+    """
+    session = _make_session(
+        login_payload={
+            "errCode": "000",
+            "errMsg": "",
+            "result": "Error_Password_Wrong",
+        }
+    )
+    api = HitronCodaAPI(session, HOST, "cusadmin", "wrong")
+    with pytest.raises(HitronAuthError, match="Error_Password_Wrong"):
+        await api.login()
+    # No cookie should be stored on a failed login.
+    assert api._cookies == {}
+
+
+async def test_login_fails_on_legacy_errcode_001():
+    """Older firmware returned errCode != '000' for auth failure; still rejected."""
+    session = _make_session(
+        login_payload={"errCode": "001", "errMsg": "Invalid username or password."}
+    )
     api = HitronCodaAPI(session, HOST, "cusadmin", "wrong")
     with pytest.raises(HitronAuthError):
+        await api.login()
+
+
+async def test_login_fails_when_set_cookie_missing():
+    """If the response has no Set-Cookie header, login is reported as auth failure."""
+    session = _make_session(
+        login_payload={"errCode": "000", "result": "success"},
+        set_cookie=None,  # explicit: no Set-Cookie
+    )
+    api = HitronCodaAPI(session, HOST, "cusadmin", "password")
+    with pytest.raises(HitronAuthError, match="No PHPSESSID"):
         await api.login()
 
 
@@ -101,7 +154,7 @@ async def test_get_system_info():
         "DeploymentName": "VIDEOTRON",
         "wifiChip": "qca",
     }
-    session = _make_session(login_ok=True, version_data=version_data)
+    session = _make_session(version_data=version_data)
     api = HitronCodaAPI(session, HOST, "cusadmin", "password")
     api._cookies = {"PHPSESSID": "abc123"}
     info = await api.get_system_info()
@@ -115,7 +168,7 @@ async def test_get_system_info():
 async def test_get_connected_devices():
     """Test fetching the connected device list with real fixture data."""
     fixture = load_fixture("connect_info.json")
-    session = _make_session(login_ok=True, hosts_data=fixture)
+    session = _make_session(hosts_data=fixture)
     api = HitronCodaAPI(session, HOST, "cusadmin", "password")
     api._cookies = {"PHPSESSID": "abc123"}
     devices = await api.get_connected_devices()
@@ -137,7 +190,6 @@ async def test_get_connected_devices():
 async def test_get_connected_devices_empty():
     """Test fetching devices when router returns empty list."""
     session = _make_session(
-        login_ok=True,
         hosts_data={"errCode": "000", "HostNumberOfEntries": "0", "Hosts_List": []},
     )
     api = HitronCodaAPI(session, HOST, "cusadmin", "password")

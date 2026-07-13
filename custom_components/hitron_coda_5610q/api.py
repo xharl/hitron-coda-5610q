@@ -131,6 +131,11 @@ class HitronCodaAPI:
 
         The router expects form-urlencoded with a JSON blob in the
         ``model`` field — NOT a JSON request body.
+
+        The CODA-5610Q returns ``errCode: "000"`` for BOTH success and
+        authentication failure. The discriminator is the ``result`` field
+        (e.g. ``"success"`` vs ``"Error_Password_Wrong"``). Checking only
+        ``errCode`` causes wrong passwords to be accepted as valid logins.
         """
         url = self._base / "1/Device/Users/Login"
         form = aiohttp.FormData()
@@ -142,11 +147,26 @@ class HitronCodaAPI:
             if resp.status != 200:
                 raise HitronConnectionError(f"Login HTTP {resp.status}")
             payload = await resp.json(content_type=None)
-            if payload.get("errCode") != "000":
-                raise HitronAuthError(payload.get("errMsg", "login failed"))
-            for cookie in self._session.cookie_jar:
-                if cookie.key == "PHPSESSID":
-                    self._cookies = {"PHPSESSID": cookie.value}
+
+            # errCode is unreliable on this firmware — both "success" and
+            # auth failures return "000". Use the "result" field instead.
+            result = payload.get("result", "")
+            if payload.get("errCode") != "000" or result.startswith("Error_"):
+                raise HitronAuthError(
+                    result or payload.get("errMsg") or "login failed"
+                )
+
+            # Read the session cookie directly from the response headers.
+            # aiohttp's session.cookie_jar is not reliably populated for
+            # POST requests (the default jar only updates for matching
+            # host requests and FormData POSTs have a version-specific
+            # quirk where Set-Cookie isn't stored). The response header
+            # is the source of truth.
+            for raw in resp.headers.getall("Set-Cookie", []):
+                name, _, rest = raw.partition("=")
+                if name.strip() == "PHPSESSID":
+                    value = rest.split(";", 1)[0].strip()
+                    self._cookies = {"PHPSESSID": value}
                     return
             raise HitronAuthError("No PHPSESSID cookie set")
 
