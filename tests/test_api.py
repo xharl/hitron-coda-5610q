@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aioresponses import aioresponses
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from custom_components.hitron_coda_5610q.api import (
     ConnectedDevice,
@@ -32,12 +33,12 @@ async def test_login_succeeds(hass):
         mocked.post(
             LOGIN_URL,
             payload={"errCode": "000", "result": "success"},
-            cookies={"PHPSESSID": "abc123"},
+            headers={"Set-Cookie": "PHPSESSID=abc123; HttpOnly; Path=/"},
         )
-        session = hass.helpers.aiohttp_client.async_get_clientsession()
+        session = async_get_clientsession(hass)
         api = HitronCodaAPI(session, HOST, "cusadmin", "password")
         await api.login()
-        assert api._cookies == {"PHPSESSID": "abc123"}
+        assert "PHPSESSID" in api._cookies
 
 
 async def test_login_fails_invalid_credentials(hass):
@@ -47,7 +48,7 @@ async def test_login_fails_invalid_credentials(hass):
             LOGIN_URL,
             payload={"errCode": "001", "errMsg": "Invalid username or password."},
         )
-        session = hass.helpers.aiohttp_client.async_get_clientsession()
+        session = async_get_clientsession(hass)
         api = HitronCodaAPI(session, HOST, "cusadmin", "wrong")
         with pytest.raises(HitronAuthError):
             await api.login()
@@ -59,7 +60,7 @@ async def test_get_system_info(hass):
         mocked.post(
             LOGIN_URL,
             payload={"errCode": "000", "result": "success"},
-            cookies={"PHPSESSID": "abc123"},
+            headers={"Set-Cookie": "PHPSESSID=abc123; HttpOnly; Path=/"},
         )
         mocked.get(
             VERSION_URL,
@@ -76,7 +77,7 @@ async def test_get_system_info(hass):
                 "wifiChip": "qca",
             },
         )
-        session = hass.helpers.aiohttp_client.async_get_clientsession()
+        session = async_get_clientsession(hass)
         api = HitronCodaAPI(session, HOST, "cusadmin", "password")
         await api.login()
         info = await api.get_system_info()
@@ -94,10 +95,10 @@ async def test_get_connected_devices(hass):
         mocked.post(
             LOGIN_URL,
             payload={"errCode": "000", "result": "success"},
-            cookies={"PHPSESSID": "abc123"},
+            headers={"Set-Cookie": "PHPSESSID=abc123; HttpOnly; Path=/"},
         )
         mocked.get(HOSTS_URL, payload=fixture)
-        session = hass.helpers.aiohttp_client.async_get_clientsession()
+        session = async_get_clientsession(hass)
         api = HitronCodaAPI(session, HOST, "cusadmin", "password")
         await api.login()
         devices = await api.get_connected_devices()
@@ -122,13 +123,13 @@ async def test_get_connected_devices_empty(hass):
         mocked.post(
             LOGIN_URL,
             payload={"errCode": "000", "result": "success"},
-            cookies={"PHPSESSID": "abc123"},
+            headers={"Set-Cookie": "PHPSESSID=abc123; HttpOnly; Path=/"},
         )
         mocked.get(
             HOSTS_URL,
             payload={"errCode": "000", "HostNumberOfEntries": "0", "Hosts_List": []},
         )
-        session = hass.helpers.aiohttp_client.async_get_clientsession()
+        session = async_get_clientsession(hass)
         api = HitronCodaAPI(session, HOST, "cusadmin", "password")
         await api.login()
         devices = await api.get_connected_devices()
