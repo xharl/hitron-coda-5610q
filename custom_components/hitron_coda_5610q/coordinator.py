@@ -86,7 +86,16 @@ class HitronCodaCoordinator(DataUpdateCoordinator[HitronCodaData]):
         # register themselves as listeners; we re-schedule after
         # that to make sure the loop is in place once listeners
         # are registered. See __init__.py.
+        _LOGGER.warning(
+            "hitron_coda_5610q: scheduling refresh; _listeners=%d, update_interval=%s",
+            len(self._listeners),
+            self._update_interval_seconds,
+        )
         self._schedule_refresh()
+        _LOGGER.warning(
+            "hitron_coda_5610q: schedule installed; _unsub_refresh=%s",
+            self._unsub_refresh is not None,
+        )
 
     async def _async_update_data(self) -> HitronCodaData:
         # The CODA-5610Q's web server cannot reliably handle 12

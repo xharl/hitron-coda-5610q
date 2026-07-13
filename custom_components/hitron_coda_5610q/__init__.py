@@ -72,7 +72,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # their listeners — so trigger an explicit schedule to make
         # sure the loop is now in place. This is the v0.2.10 fix for
         # "entities exist but never update".
+        _LOGGER.warning(
+            "hitron_coda_5610q: re-scheduling after forwards; _listeners=%d",
+            len(coordinator._listeners),
+        )
         coordinator._schedule_refresh()
+        _LOGGER.warning(
+            "hitron_coda_5610q: re-schedule installed; _unsub_refresh=%s",
+            coordinator._unsub_refresh is not None,
+        )
 
         entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
