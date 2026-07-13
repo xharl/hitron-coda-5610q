@@ -21,7 +21,11 @@ _LOGGER = logging.getLogger(__name__)
 PLATFORMS = [
     Platform.DEVICE_TRACKER,
     Platform.SENSOR,
-    Platform.BUTTON,
+    # v0.2.14: removed Platform.BUTTON. The pause/resume buttons were
+    # dropped from the integration, and an empty button.py module
+    # would cause HA to log "module has no attribute async_setup_entry"
+    # on every startup. The cleanest fix is to remove the platform
+    # entirely so HA doesn't try to set it up.
     Platform.BINARY_SENSOR,
 ]
 
