@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.4 — 2026-07-13
+
+### Changed
+- Added verbose `WARNING`-level logging throughout `async_setup_entry` so
+  HA logs show every step (start, first refresh, platform forward, any
+  exception with full traceback). Helps diagnose silent setup failures.
+
 ## 0.2.3 — 2026-07-13
 
 ### Fixed

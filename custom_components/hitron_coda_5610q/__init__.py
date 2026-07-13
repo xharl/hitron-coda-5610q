@@ -1,6 +1,8 @@
 """The Hitron CODA-5610Q integration."""
 from __future__ import annotations
 
+import logging
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_SCAN_INTERVAL, Platform
 from homeassistant.core import HomeAssistant
@@ -10,6 +12,8 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .api import HitronCodaAPI
 from .const import DEFAULT_SCAN_INTERVAL, DOMAIN
 from .coordinator import HitronCodaCoordinator
+
+_LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [
     Platform.DEVICE_TRACKER,
@@ -24,27 +28,41 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Hitron CODA-5610Q from a config entry."""
-    session = async_get_clientsession(hass)
-    api = HitronCodaAPI(
-        session,
-        entry.data["host"],
-        entry.data["username"],
-        entry.data["password"],
+    _LOGGER.warning(
+        "hitron_coda_5610q.async_setup_entry START entry_id=%s data_keys=%s",
+        entry.entry_id,
+        list(entry.data.keys()),
     )
+    try:
+        session = async_get_clientsession(hass)
+        api = HitronCodaAPI(
+            session,
+            entry.data["host"],
+            entry.data["username"],
+            entry.data["password"],
+        )
 
-    scan_interval = entry.options.get(
-        CONF_SCAN_INTERVAL,
-        DEFAULT_SCAN_INTERVAL,
-    )
+        scan_interval = entry.options.get(
+            CONF_SCAN_INTERVAL,
+            DEFAULT_SCAN_INTERVAL,
+        )
 
-    coordinator = HitronCodaCoordinator(hass, api, scan_interval)
-    await coordinator.async_config_entry_first_refresh()
+        coordinator = HitronCodaCoordinator(hass, api, scan_interval)
+        _LOGGER.warning("hitron_coda_5610q: starting first refresh")
+        await coordinator.async_config_entry_first_refresh()
+        _LOGGER.warning("hitron_coda_5610q: first refresh OK")
 
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+        hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
-    return True
+        _LOGGER.warning("hitron_coda_5610q: forwarding setups to %s", PLATFORMS)
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        _LOGGER.warning("hitron_coda_5610q: forwards OK")
+
+        entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+        return True
+    except Exception as err:
+        _LOGGER.exception("hitron_coda_5610q.async_setup_entry FAILED: %s", err)
+        raise
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
