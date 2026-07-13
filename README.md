@@ -10,32 +10,42 @@ with this model.
 ## Features
 
 ### Device Tracker
-- One `device_tracker` entity per connected device (MAC-based)
-- WiFi RSSI, band, SSID, bitrate, channel as extra attributes
+- One `device_tracker` entity per connected device
+- **Hostname-based identity** (v0.2.13+) — survives MAC rotation
+  (iOS Private WiFi Address, Android 10+ randomized MACs) so a phone
+  that rotates its MAC every few hours keeps a stable entity_id
+- Per-device WiFi band, SSID, bitrate, channel, signal strength as
+  extra attributes (when the router reports them)
 - Source type: `router`
-- Pause/resume buttons per device
 
 ### Sensors
+**Always exposed (12 entities):**
 - **Connected devices count** — total devices on LAN
-- **WAN/LAN uptime** — seconds
-- **WAN/LAN traffic** — RX/TX bytes
+- **WAN uptime** — seconds
+- **LAN uptime** — seconds
+- **WAN traffic** — RX / TX bytes (lifetime)
+- **LAN traffic** — RX / TX bytes (lifetime)
 - **WAN IP address** — current public IP
 - **Cable Modem IP** — CM-side IP from CMTS
 - **Firewall level** — current security level
-- **DOCSIS data rates** — downstream/upstream rates
+- **Downstream data rate** — bonded DOCSIS rate
+- **Upstream data rate** — bonded DOCSIS rate
+
+**Opt-in via `Expose diagnostics` (32+ entities, default off):**
 - **Per-downstream-channel SNR** — dB per channel
 - **Per-downstream-channel power** — dBmV per channel
 - **Per-upstream-channel power** — dBmV per channel
 
+These are useful for diagnosing cable plant issues (degraded SNR,
+modem upstreams that are too hot) but most users don't want 32
+extra sensors in their UI. Toggle on in the integration's
+**Options** panel when you need them.
+
 ### Binary Sensors
-- **DOCSIS provisioning steps** — hwInit, findDownstream, ranging, dhcp, timeOfday, downloadCfg, registration
 - **Network access** — whether the CMTS permits traffic
 - **Firewall enabled** — on/off
 - **WiFi radio on/off** — per band (2.4G / 5G)
 - **Ethernet port link** — per port (with WAN port identified)
-
-### Buttons
-- **Pause** / **Resume** per device — control internet access per MAC
 
 ## Installation
 
@@ -61,6 +71,12 @@ Copy the `custom_components/hitron_coda_5610q/` directory into your
 | Username | `cusadmin` | Router admin username |
 | Password | — | Router admin password (often the WiFi password) |
 
+### Options
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| Expose diagnostics | `false` | When true, create per-channel DOCSIS power/SNR sensors (32+ entities). Useful for cable plant troubleshooting. |
+
 ## Supported devices
 
 - Hitron CODA-5610Q (hardware rev 1A, firmware 7.3.5.1.2b22, API 1.12.1)
@@ -76,6 +92,16 @@ Copy the `custom_components/hitron_coda_5610q/` directory into your
   re-logs in automatically on 401/403
 - **RSSI not showing** — only WiFi-connected clients have RSSI; Ethernet
   devices don't have this attribute
+- **"Person" entity oscillating between home / not_home** — common with
+  iOS Private WiFi Address and Android 10+ randomized MACs. As of
+  v0.2.13 the device_tracker uses hostname-based identity so the
+  entity stays the same across MAC rotations. The router-side MAC
+  attribute (`current_mac` in the entity's `extra_state_attributes`)
+  will change, but the entity_id and `person.*` state should be
+  stable. If you still see drift, the Leave Home automation in
+  `/config/automations.yaml` has a 5-minute delay to absorb
+  short-term flapping — see the migration guide for the v0.2.13
+  service that walks the entity registry.
 
 ## Development
 
