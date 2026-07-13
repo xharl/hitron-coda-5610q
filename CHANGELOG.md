@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.6 — 2026-07-13
+
+### Fixed
+- **First refresh intermittently failed with empty/malformed responses from
+  the router** (`Bad response from ...: Expecting value: line 1 column 1
+  (char 0)`). The CODA-5610Q's tiny web server occasionally returns empty
+  bodies when under concurrent load, which caused 1-2 of the 12 endpoints
+  in the coordinator's parallel gather to fail on each attempt. The config
+  entry was created but no entities were registered because the
+  `asyncio.gather` raised on the first failure.
+- Added retry-with-relogin to `_request_json`: up to 3 attempts, with
+  exponential backoff (0.5s, 1.0s) and a fresh login before each retry.
+  Transient empty responses are now recovered automatically.
+
 ## 0.2.5 — 2026-07-13
 
 ### Fixed

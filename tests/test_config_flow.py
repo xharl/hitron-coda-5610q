@@ -51,6 +51,12 @@ def _make_session(login_payload, version_payload):
         async def json(self, content_type=None):
             return self._payload
 
+        async def text(self):
+            if self._payload is None:
+                return ""
+            import json as _json
+            return _json.dumps(self._payload)
+
     def _post(url, data=None):
         if "Login" in str(url):
             sc = "PHPSESSID=abc123; path=/; HttpOnly" if login_payload.get("result") == "success" else None
@@ -70,7 +76,7 @@ def _make_session(login_payload, version_payload):
 
 
 def _make_session_raising(exception):
-    """Build a mock session whose post() raises the given exception."""
+    """Build a mock session whose post() raises the given exception on enter."""
     session = MagicMock()
 
     class _TimeoutCM:
@@ -80,6 +86,7 @@ def _make_session_raising(exception):
             return False
 
     session.post = lambda url, data=None: _TimeoutCM()
+
     async def _close():
         return None
     session.close = _close

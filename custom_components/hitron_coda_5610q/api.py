@@ -114,30 +114,72 @@ class HitronCodaAPI:
         failure, etc.) is translated into ``HitronConnectionError`` so
         the config flow and ``__init__.py`` can handle it uniformly
         without importing aiohttp.
+
+        The CODA-5610Q's web server occasionally returns an empty or
+        malformed body when under load (e.g. during the 12-way
+        parallel gather the coordinator runs on first refresh).
+        We retry up to 2 times with a short backoff, re-authenticating
+        on each attempt since the session cookie may have been lost.
         """
         headers = {
             "X-Requested-With": "XMLHttpRequest",
             "Referer": str(self._base / "webpages/index.html"),
         }
-        try:
-            async with self._session.get(
-                url, cookies=self._cookies, headers=headers
-            ) as resp:
-                if resp.status in (401, 403):
-                    # Session expired — re-login once
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                async with self._session.get(
+                    url, cookies=self._cookies, headers=headers
+                ) as resp:
+                    if resp.status in (401, 403):
+                        # Session expired — re-login and retry
+                        await self.login()
+                        async with self._session.get(
+                            url, cookies=self._cookies, headers=headers
+                        ) as resp2:
+                            text = await resp2.text()
+                            if not text:
+                                raise HitronConnectionError(
+                                    f"Empty response from {url} after re-auth"
+                                )
+                            return await resp2.json(content_type=None)
+                    text = await resp.text()
+                    if not text:
+                        raise HitronConnectionError(
+                            f"Empty response from {url} (status {resp.status})"
+                        )
+                    return await resp.json(content_type=None)
+            except (aiohttp.ClientError, HitronConnectionError) as err:
+                last_err = err
+                _LOGGER.debug(
+                    "HitronCodaAPI: GET %s failed (attempt %d/3): %s",
+                    url, attempt + 1, err,
+                )
+                # Re-login before retrying in case the session died
+                try:
                     await self.login()
-                    async with self._session.get(
-                        url, cookies=self._cookies, headers=headers
-                    ) as resp2:
-                        return await resp2.json(content_type=None)
-                return await resp.json(content_type=None)
-        except aiohttp.ClientError as err:
-            raise HitronConnectionError(str(err)) from err
-        except (ValueError, KeyError, TypeError) as err:
-            # Malformed JSON / unexpected payload shape from the router.
-            raise HitronConnectionError(
-                f"Bad response from {url}: {err}"
-            ) from err
+                except Exception:
+                    pass
+            except (ValueError, KeyError, TypeError) as err:
+                # JSON parse error — the body was not JSON (e.g. router
+                # returned the login HTML). Treat as a transient error
+                # and retry after re-authenticating.
+                last_err = err
+                _LOGGER.debug(
+                    "HitronCodaAPI: GET %s returned bad JSON (attempt %d/3): %s",
+                    url, attempt + 1, err,
+                )
+                try:
+                    await self.login()
+                except Exception:
+                    pass
+            # Small backoff between retries
+            import asyncio
+            await asyncio.sleep(0.5 * (attempt + 1))
+        # All retries exhausted
+        raise HitronConnectionError(
+            f"Bad response from {url}: {last_err}"
+        ) from last_err
 
     async def login(self) -> None:
         """Authenticate and store the session cookie.

@@ -39,6 +39,15 @@ class MockResponse:
     async def json(self, content_type=None):
         return self._data
 
+    async def text(self):
+        # Real aiohttp returns the body as a string. Our mock serializes
+        # the dict so json() can round-trip it, and returns "" if the
+        # data is missing/None (simulating empty body).
+        if self._data is None:
+            return ""
+        import json as _json
+        return _json.dumps(self._data)
+
     async def __aenter__(self):
         return self
 
@@ -196,11 +205,80 @@ async def test_login_translates_malformed_json_to_connection_error():
             return False
         async def json(self, content_type=None):
             raise ValueError("not json")
+        async def text(self):
+            return ""
 
     session.post = lambda url, data=None: _BadJsonResponse()
     api = HitronCodaAPI(session, HOST, "cusadmin", "password")
     with pytest.raises(HitronConnectionError, match="Bad login response"):
         await api.login()
+
+
+async def test_get_recovers_from_empty_response():
+    """Regression: CODA-5610Q occasionally returns empty bodies under load.
+    The GET should retry up to 3 times, re-authenticating between attempts,
+    and recover if a subsequent attempt gets a real response.
+    """
+    session = MagicMock()
+    session.cookie_jar = []
+
+    call_count = {"post": 0, "get": 0}
+
+    class _GoodLogin:
+        status = 200
+        def __init__(self):
+            self.headers = MagicMock()
+            self.headers.getall = lambda name, default=[]: (
+                ["PHPSESSID=abc123; path=/; HttpOnly"]
+                if name.lower() == "set-cookie" else []
+            )
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def json(self, content_type=None):
+            return {"errCode": "000", "result": "success"}
+        async def text(self):
+            return '{"errCode":"000","result":"success"}'
+
+    class _EmptyThenGood:
+        """First call returns empty body, second returns good data."""
+        def __init__(self):
+            self.headers = MagicMock()
+            self.headers.getall = lambda name, default=[]: []
+            self.status = 200
+        async def __aenter__(self):
+            call_count["get"] += 1
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def json(self, content_type=None):
+            if call_count["get"] == 1:
+                raise ValueError("Expecting value: line 1 column 1 (char 0)")
+            return {"errCode": "000", "data": "ok"}
+        async def text(self):
+            if call_count["get"] == 1:
+                return ""
+            return '{"errCode":"000","data":"ok"}'
+
+    def _post(url, data=None):
+        call_count["post"] += 1
+        return _GoodLogin()
+
+    def _get(url, cookies=None, headers=None):
+        return _EmptyThenGood()
+
+    session.post = _post
+    session.get = _get
+
+    api = HitronCodaAPI(session, HOST, "cusadmin", "password")
+    # Use the retry path via _request_json
+    from yarl import URL
+    result = await api._request_json(URL("http://192.168.0.1/1/Device/Test"))
+    # Should have logged in once initially, then once per retry
+    assert result == {"errCode": "000", "data": "ok"}
+    # Verify we recovered: at least 2 GETs were made
+    assert call_count["get"] >= 2
 
 
 async def test_get_system_info():
