@@ -176,6 +176,15 @@ class HitronCodaDeviceTracker(CoordinatorEntity[HitronCodaCoordinator], ScannerE
             self._attr_name = identity.current_mac.replace(':', '')
 
     @property
+    def unique_id(self) -> str | None:
+        """Return the stable unique_id for this entity.
+
+        ScannerEntity defaults to returning mac_address, but we use
+        hostname-based identity keys to survive MAC rotation.
+        """
+        return self._attr_unique_id
+
+    @property
     def available(self) -> bool:
         """Entity is available whenever the coordinator has fresh data."""
         return self.coordinator.last_update_success
