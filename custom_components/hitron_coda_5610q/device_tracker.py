@@ -213,6 +213,11 @@ class HitronCodaDeviceTracker(CoordinatorEntity[HitronCodaCoordinator], ScannerE
         the device rotated its MAC, `current_mac` has already been
         updated, so this lookup is straightforward.
         """
+        if not self.coordinator.data or not self.coordinator.data.devices:
+            _LOGGER.debug(
+                "hitron_coda_5610q device_tracker: is_connected called but no coordinator data"
+            )
+            return False
         for d in self.coordinator.data.devices:
             if d.mac_address == self._identity.current_mac:
                 return d.status
