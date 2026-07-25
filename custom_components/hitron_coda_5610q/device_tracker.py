@@ -40,13 +40,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from homeassistant.components.device_tracker import SourceType, TrackerEntity
-from homeassistant.components.device_tracker.const import (
-    DeviceTrackerEntityCapabilityAttribute,
-    TrackingType,
-)
+from homeassistant.components.device_tracker import ScannerEntity, SourceType
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import STATE_HOME, STATE_NOT_HOME
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers.device_registry import DeviceInfo, async_get as async_get_device_registry
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -152,15 +147,12 @@ class DeviceIdentity:
     user_alias: str | None = None
 
 
-class HitronCodaDeviceTracker(CoordinatorEntity[HitronCodaCoordinator], TrackerEntity):
+class HitronCodaDeviceTracker(CoordinatorEntity[HitronCodaCoordinator], ScannerEntity):
     """A device seen on the LAN, identified by hostname in v0.2.13+."""
 
     _attr_has_entity_name = True
     _attr_source_type = SourceType.ROUTER
     _attr_entity_category = None
-    _attr_capability_attributes = {
-        DeviceTrackerEntityCapabilityAttribute.TRACKING_TYPE: TrackingType.CONNECTION
-    }
 
     def __init__(
         self,
@@ -223,10 +215,6 @@ class HitronCodaDeviceTracker(CoordinatorEntity[HitronCodaCoordinator], TrackerE
             if d.mac_address == self._identity.current_mac:
                 return d.ip_address
         return None
-
-    @property
-    def state(self) -> str:
-        return STATE_HOME if self.is_connected else STATE_NOT_HOME
 
     # ---- device registry ----
 
