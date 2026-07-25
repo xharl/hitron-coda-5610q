@@ -35,3 +35,12 @@ CONF_TRACK_BY = "track_by"
 
 # Service names
 SERVICE_MIGRATE_TO_V0_2_13 = "migrate_to_v0_2_13"
+
+# New in v0.2.15: optional mDNS discovery to find friendlier names
+# for devices that don't advertise hostnames to the router via DHCP.
+CONF_ENABLE_MDNS = "enable_mdns"
+# New in v0.2.15: user-defined aliases for MAC or current identity.
+CONF_DEVICE_ALIASES = "device_aliases"
+# New in v0.2.15: when True, include the device OUI/manufacturer in the
+# display name for still-unidentified devices.
+CONF_USE_OUI_LABEL = "use_oui_label"

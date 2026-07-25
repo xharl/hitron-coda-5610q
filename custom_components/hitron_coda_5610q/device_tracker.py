@@ -1,6 +1,8 @@
 """Device tracker for the Hitron CODA-5610Q.
 
 v0.2.13: hostname-based identity to survive MAC rotation.
+v0.2.15: fingerprinting fallback (mDNS, NetBIOS, SSDP, OUI, aliases)
+         for devices whose router-reported hostname is "Unknown".
 
 Background: the v0.2.12 integration tracked every device by MAC address,
 using the MAC as the unique_id. This was correct for stationary devices
@@ -10,52 +12,63 @@ such a device reconnects, the router sees a new random MAC, the
 integration creates a new entity, and the old entity stays in the
 entity registry forever in `not_home` state.
 
-In the user's setup, this caused Leave Home automations to drift:
-the Pixel 6 (randomized MAC, currently `be:fe:90:46:4d:4b`) would
-appear as `device_tracker.hitron_coda_5610q_15` and be fed into
-`person.xavier` via the user-added "tracked devices" list. When the
-phone's MAC rotated, the new MAC became `device_tracker.hitron_coda_5610q_16`
-in `not_home` state, and the old `_15` stayed in `not_home` too. The
-person entity would oscillate between home and not_home as the
-person-picker weighed the two sources.
-
 v0.2.13 fix: track devices by hostname (the router's reported
 `hostName` field, which is stable for any device that doesn't override
 it). MAC is now an attribute of the entity, not its identity. When a
 device with a known hostname reconnects under a new MAC, the
-existing entity is updated in place. The old MAC stays in the
-recorder history as a "last seen" but the entity identity never
-changes.
+existing entity is updated in place.
+
+v0.2.15 enhancement: when the router reports hostname="Unknown",
+the integration tries mDNS, NetBIOS, SSDP/UPnP, DHCP reservations,
+and OUI/manufacturer lookup to build a stable identity. Users can
+also assign aliases in the config entry options.
 
 Identity keys, in order of preference:
-  1. hostname (router-reported, stable)
-  2. MAC (fallback for devices that don't report a hostname)
-
-The integration exposes a config option `track_by: mac | hostname`
-(default `hostname` in v0.2.13) for users who want the old behavior.
-The migration service `hitron_coda_5610q.migrate_to_v0_2_13` is a
-one-shot that maps existing v0.2.12 entities to hostname-based
-entities by inspecting the entity_registry and device_registry.
+  1. user-defined alias
+  2. hostname (router-reported or DHCP reservation)
+  3. mDNS / Bonjour name
+  4. NetBIOS name
+  5. SSDP / UPnP friendlyName
+  6. OUI/manufacturer + MAC
+  7. raw MAC (final fallback)
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from dataclasses import dataclass, field
 from typing import Any
 
 from homeassistant.components.device_tracker import SourceType, TrackerEntity
+from homeassistant.components.device_tracker.const import (
+    DeviceTrackerEntityCapabilityAttribute,
+    TrackingType,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import STATE_HOME, STATE_NOT_HOME
 from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.device_registry import DeviceInfo, async_get as async_get_device_registry
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, SERVICE_MIGRATE_TO_V0_2_13
+from .const import (
+    CONF_DEVICE_ALIASES,
+    CONF_ENABLE_MDNS,
+    CONF_USE_OUI_LABEL,
+    DOMAIN,
+    SERVICE_MIGRATE_TO_V0_2_13,
+)
 from .coordinator import HitronCodaCoordinator
+from .fingerprint import DeviceFingerprinter
+from .oui import lookup_oui
 
 _LOGGER = logging.getLogger(__name__)
+
+
+# v0.2.15: maximum concurrent fingerprinting probes to avoid
+# overwhelming the LAN / event loop.
+_FINGERPRINT_SEMAPHORE = asyncio.Semaphore(8)
 
 
 def normalize_hostname(hostname: str | None) -> str | None:
@@ -64,12 +77,12 @@ def normalize_hostname(hostname: str | None) -> str | None:
     - Strip leading/trailing whitespace
     - Lower-case
     - Replace illegal filesystem characters with '_'
-    - Return None for empty strings (caller should fall back to MAC)
+    - Return None for empty/placeholder strings (caller falls back to MAC)
     """
     if not hostname:
         return None
     h = hostname.strip().lower()
-    if not h:
+    if not h or h in ("unknown", "--", "<unknown>"):
         return None
     # Routers sometimes report hostnames with unicode or filesystem-unsafe chars;
     # collapse them so the resulting unique_id is filesystem-safe.
@@ -77,17 +90,48 @@ def normalize_hostname(hostname: str | None) -> str | None:
     return h or None
 
 
-def make_entity_unique_id(track_by: str, hostname: str | None, mac: str) -> str:
+def _mac_key(mac: str) -> str:
+    """Return a normalized MAC string for lookups."""
+    return mac.upper().replace(":", "").replace("-", "")
+
+
+def resolve_hostname(
+    mac: str,
+    router_hostname: str | None,
+    dhcp_reservations: list[dict[str, str]],
+) -> str | None:
+    """Pick the best hostname for a device.
+
+    Order of preference:
+      1. Router live host list hostname (if meaningful)
+      2. DHCP reservation hostname for this MAC
+      3. None → fall back to MAC-based identity
+    """
+    hostname = normalize_hostname(router_hostname)
+    if hostname:
+        return hostname
+
+    mac_norm = _mac_key(mac)
+    for r in dhcp_reservations:
+        if _mac_key(r.get("mac_address", "")) == mac_norm:
+            hostname = normalize_hostname(r.get("hostname"))
+            if hostname:
+                return hostname
+    return None
+
+
+def make_entity_unique_id(track_by: str, key: str, hostname: str | None, mac: str) -> str:
     """Build a stable unique_id for a device_tracker entity.
 
-    For hostname tracking: f"{DOMAIN}_host_{hostname}"
-    For MAC tracking (legacy): f"{DOMAIN}_{mac}"
+    For hostname tracking: f"{DOMAIN}_host_{key}" where key is the
+    disambiguated hostname. For MAC tracking (legacy): f"{DOMAIN}_{mac}".
+
+    Devices with no/empty/"unknown"/"Unknown" hostname fall back to MAC-keyed IDs
+    so we don't create dozens of colliding "hitron_coda_5610q_host_unknown"
+    entities.
     """
     if track_by == "hostname" and hostname:
-        # Use the hostname directly. If a collision occurs between two
-        # devices with the same hostname (e.g. two phones both named
-        # "android"), disambiguate by MAC hash suffix.
-        return f"{DOMAIN}_host_{hostname}"
+        return f"{DOMAIN}_host_{key}"
     return f"{DOMAIN}_{mac}"
 
 
@@ -103,6 +147,9 @@ class DeviceIdentity:
     current_mac: str    # most recent MAC seen for this device
     track_by: str       # "hostname" or "mac"
     hostname: str | None = None  # last-seen hostname (may be None)
+    fingerprint: dict[str, Any] = field(default_factory=dict)
+    oui_label: str | None = None
+    user_alias: str | None = None
 
 
 class HitronCodaDeviceTracker(CoordinatorEntity[HitronCodaCoordinator], TrackerEntity):
@@ -110,6 +157,10 @@ class HitronCodaDeviceTracker(CoordinatorEntity[HitronCodaCoordinator], TrackerE
 
     _attr_has_entity_name = True
     _attr_source_type = SourceType.ROUTER
+    _attr_entity_category = None
+    _attr_capability_attributes = {
+        DeviceTrackerEntityCapabilityAttribute.TRACKING_TYPE: TrackingType.CONNECTION
+    }
 
     def __init__(
         self,
@@ -119,10 +170,23 @@ class HitronCodaDeviceTracker(CoordinatorEntity[HitronCodaCoordinator], TrackerE
         super().__init__(coordinator)
         self._identity = identity
         self._attr_unique_id = make_entity_unique_id(
-            identity.track_by, identity.hostname, identity.current_mac
+            identity.track_by, identity.key, identity.hostname, identity.current_mac
         )
-        # Stable name for legacy/UI display. If host is known, use it; else MAC.
-        self._attr_name = identity.hostname or identity.current_mac
+        # Stable name for legacy/UI display. Priority:
+        # 1. user alias, 2. hostname, 3. OUI label + MAC, 4. raw MAC
+        if identity.user_alias:
+            self._attr_name = identity.user_alias
+        elif identity.hostname:
+            self._attr_name = identity.hostname
+        elif identity.oui_label and coordinator.config_entry.options.get(CONF_USE_OUI_LABEL, True):
+            self._attr_name = f"{identity.oui_label}_{identity.current_mac.replace(':', '')}"
+        else:
+            self._attr_name = identity.current_mac.replace(':', '')
+
+    @property
+    def available(self) -> bool:
+        """Entity is available whenever the coordinator has fresh data."""
+        return self.coordinator.last_update_success
 
     # ---- identity helpers ----
 
@@ -180,29 +244,69 @@ class HitronCodaDeviceTracker(CoordinatorEntity[HitronCodaCoordinator], TrackerE
         replaces the old in the device's connections; the device entry
         keeps the same id, so it doesn't appear as a new device.
         """
+        name = self._compute_device_name()
         return DeviceInfo(
             identifiers={(DOMAIN, self._identity.key)},
             connections={("mac", self._identity.current_mac)},
-            manufacturer="Unknown",
+            manufacturer=self._identity.oui_label or "Unknown",
             model="LAN device",
-            name=self._identity.hostname or self._identity.current_mac,
+            name=name,
             via_device=(
                 DOMAIN,
                 self.coordinator.data.system_info.serial_number,
             ),
         )
 
+    def _compute_device_name(self) -> str:
+        if self._identity.user_alias:
+            return self._identity.user_alias
+        if self._identity.hostname:
+            return self._identity.hostname
+        if self._identity.oui_label and self.coordinator.config_entry.options.get(CONF_USE_OUI_LABEL, True):
+            return f"{self._identity.oui_label} {self._identity.current_mac.replace(':', '')}"
+        return self._identity.current_mac.replace(":", "")
+
+    async def async_added_to_hass(self) -> None:
+        """Update device registry entry when entity first loads.
+
+        Home Assistant only creates the device entry on first sight;
+        if our friendly name / manufacturer changed later, we need to
+        update it explicitly so OUI labels and aliases show up.
+        """
+        await super().async_added_to_hass()
+        dev_reg = async_get_device_registry(self.hass)
+        if device := dev_reg.async_get_device(
+            identifiers={(DOMAIN, self._identity.key)},
+        ):
+            name = self._compute_device_name()
+            manufacturer = self._identity.oui_label or "Unknown"
+            if device.name != name or device.manufacturer != manufacturer:
+                dev_reg.async_update_device(
+                    device.id,
+                    name=name,
+                    manufacturer=manufacturer,
+                )
+                _LOGGER.warning(
+                    "hitron_coda_5610q device_tracker: updated device registry name=%s manufacturer=%s for key=%s",
+                    name, manufacturer, self._identity.key,
+                )
+
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        attrs: dict[str, Any] = {}
+        attrs: dict[str, Any] = {
+            "identity_key": self._identity.key,
+            "current_mac": self._identity.current_mac,
+            "router_hostname": self._identity.hostname,
+            "user_alias": self._identity.user_alias,
+            "oui": self._identity.oui_label,
+        }
+        if self._identity.fingerprint:
+            attrs["fingerprint"] = self._identity.fingerprint
         for d in self.coordinator.data.devices:
             if d.mac_address == self._identity.current_mac:
                 attrs["interface"] = d.interface
                 attrs["address_source"] = d.address_source
                 attrs["action"] = d.action
-                # Also expose current MAC explicitly so users can see
-                # when the device has rotated.
-                attrs["current_mac"] = d.mac_address
                 break
         # Enrich with WiFi client info
         for wc in self.coordinator.data.wifi_clients:
@@ -216,8 +320,12 @@ class HitronCodaDeviceTracker(CoordinatorEntity[HitronCodaCoordinator], TrackerE
         return attrs
 
     @property
+    def has_entity_name(self) -> bool:
+        return False
+
+    @property
     def name(self) -> str | None:
-        return None
+        return self._attr_name
 
 
 # ---- setup + identity bookkeeping ----
@@ -229,72 +337,151 @@ async def async_setup_entry(
 ) -> None:
     """Set up device tracker entities, one per stable device identity.
 
-    v0.2.13 behavior: each unique hostname (or MAC if hostname missing)
-    gets exactly one entity. If a device with hostname "Pixel-6" has
-    MAC "be:fe:90:46:4d:4b" today and "9a:55:de:11:22:33" tomorrow,
-    the same entity handles both.
-
-    The list of entities is recomputed every time the coordinator has
-    new data, so the integration can:
-      - Create entities for new devices (first time seen)
-      - Update the `current_mac` on existing entities in place
-      - Leave entities alive after a device disconnects (state = not_home
-        is set automatically via the `state` property)
+    v0.2.15 behavior: each device gets one entity. Identity is stable
+    hostname when available; otherwise a fingerprint-based key (mDNS,
+    NetBIOS, SSDP, user alias, or MAC fallback). MAC rotation is
+    handled by updating `current_mac` on existing entities.
     """
     coordinator: HitronCodaCoordinator = hass.data[DOMAIN][entry.entry_id]
-    track_by = entry.options.get("track_by", "hostname")  # default new behavior
-    host_to_identity = _build_identities(coordinator, track_by)
+    track_by = entry.options.get("track_by", "hostname")
+    fingerprinter = DeviceFingerprinter(hass, entry.options)
 
-    # Get the existing tracker entities for this entry (across reloads)
-    # so we can update current_mac on known devices.
-    existing = _existing_trackers_by_key(hass, entry.entry_id, track_by)
+    host_to_identity = await _build_identities(hass, coordinator, fingerprinter, track_by)
+    _LOGGER.warning(
+        "hitron_coda_5610q device_tracker: built %d identities (track_by=%s)",
+        len(host_to_identity),
+        track_by,
+    )
+    for key, ident in list(host_to_identity.items())[:5]:
+        _LOGGER.warning(
+            "  identity key=%s mac=%s hostname=%s alias=%s oui=%s fingerprint=%s",
+            key, ident.current_mac, ident.hostname, ident.user_alias, ident.oui_label,
+            ident.fingerprint,
+        )
+
+    # Keep a per-entry map of live tracker instances so we can update
+    # their MAC in place when a device reconnects under a new MAC.
+    tracker_store_key = f"{entry.entry_id}_trackers"
+    if tracker_store_key not in hass.data[DOMAIN]:
+        hass.data[DOMAIN][tracker_store_key] = {}
+    tracker_store: dict[str, HitronCodaDeviceTracker] = hass.data[DOMAIN][tracker_store_key]
 
     new_entities: list[HitronCodaDeviceTracker] = []
     for key, identity in host_to_identity.items():
-        if key in existing:
-            # The platform's coordinator listener mechanism handles state
-            # updates for existing entities. We don't need to (and
-            # can't easily) reach the live instance here — the key alone
-            # tells us not to add a duplicate. The HA coordinator will
-            # fire its listener on every scan, and the entity's `state`
-            # property reads from coordinator.data, so the device's
-            # current MAC is picked up automatically on the next refresh.
-            continue
-        new_entities.append(HitronCodaDeviceTracker(coordinator, identity))
+        tracker = tracker_store.get(key)
+        if tracker is not None and tracker._identity.current_mac != identity.current_mac:
+            _LOGGER.warning(
+                "hitron_coda_5610q device_tracker: updating MAC for key=%s %s -> %s",
+                key, tracker._identity.current_mac, identity.current_mac,
+            )
+            tracker._identity = identity
+            tracker.async_write_ha_state()
+        elif tracker is None:
+            tracker = HitronCodaDeviceTracker(coordinator, identity)
+            tracker_store[key] = tracker
+            new_entities.append(tracker)
 
+    _LOGGER.warning(
+        "hitron_coda_5610q device_tracker: adding %d new entities (sample unique_ids: %s)",
+        len(new_entities),
+        ", ".join([e.unique_id for e in new_entities[:3]]) if new_entities else "none",
+    )
     if new_entities:
-        async_add_entities(new_entities)
+        try:
+            async_add_entities(new_entities)
+        except Exception:
+            _LOGGER.exception("hitron_coda_5610q device_tracker: async_add_entities failed")
 
 
-def _build_identities(
+async def _build_identities(
+    hass: HomeAssistant,
     coordinator: HitronCodaCoordinator,
+    fingerprinter: DeviceFingerprinter,
     track_by: str,
 ) -> dict[str, DeviceIdentity]:
     """Map stable identity key -> DeviceIdentity for all currently-seen devices.
 
-    Key is hostname (normalized) when track_by == "hostname", else MAC.
+    v0.2.15 builds identities using multiple fingerprinting methods:
+      1. User-defined alias (from config entry options)
+      2. Router hostname or DHCP reservation
+      3. mDNS / Bonjour name by IP
+      4. NetBIOS name
+      5. SSDP / UPnP friendlyName
+      6. OUI/manufacturer + MAC
+      7. Raw MAC (final fallback)
 
-    Within a single scan, two devices with the same hostname would
-    collide; we disambiguate by MAC-hash suffix in that case. With
-    typical home networks this is rare (each device has its own
-    hostname) but possible (e.g. two "android" devices).
+    The chosen key is stable as long as the same method keeps returning
+    the same name for a device. When a device rotates its MAC but keeps
+    the same hostname / mDNS name, the entity identity survives.
     """
     seen_keys: dict[str, int] = {}
     out: dict[str, DeviceIdentity] = {}
 
+    reservations = coordinator.data.dhcp_reservations
+
+    # Run mDNS/NetBIOS/SSDP resolves in parallel with a bounded semaphore
+    async def _resolve_one(d):
+        async with _FINGERPRINT_SEMAPHORE:
+            return await fingerprinter.resolve_name(
+                d.mac_address,
+                d.ip_address,
+                d.hostname,
+            )
+
+    resolve_tasks = {d.mac_address: _resolve_one(d) for d in coordinator.data.devices}
+    resolve_results = {}
+    if resolve_tasks:
+        resolve_results = dict(
+            zip(
+                resolve_tasks.keys(),
+                await asyncio.gather(*resolve_tasks.values(), return_exceptions=True),
+            )
+        )
+
     for d in coordinator.data.devices:
-        hostname = normalize_hostname(d.hostname) if track_by == "hostname" else None
-        base_key = hostname or d.mac_address
-        # disambiguate collisions
+        mac = d.mac_address
+        router_hostname = resolve_hostname(mac, d.hostname, reservations)
+
+        # Fingerprint: alias/mDNS/NetBIOS/SSDP
+        resolved_name = None
+        fingerprint: dict[str, Any] = {}
+        if mac in resolve_results:
+            result = resolve_results[mac]
+            if isinstance(result, tuple) and len(result) == 2:
+                resolved_name, fingerprint = result
+            elif isinstance(result, Exception):
+                _LOGGER.debug("Fingerprint failed for %s: %s", mac, result)
+
+        # Pick the identity key.
+        alias = fingerprinter.alias_for(mac, router_hostname or resolved_name)
+        if track_by == "mac" or not (router_hostname or resolved_name or alias):
+            # Legacy mode: every MAC is its own entity.
+            base_key = mac
+            hostname = None
+            user_alias = None
+        else:
+            # Prefer user alias for display, but the stable key is still
+            # the router hostname / mDNS name. If neither exists, fall
+            # back to MAC so we don't create colliding entities.
+            hostname = router_hostname or resolved_name
+            user_alias = alias
+            base_key = hostname or mac
+
+        oui = lookup_oui(mac)
+
+        # disambiguate collisions (two devices with same hostname)
         n = seen_keys.get(base_key, 0)
         seen_keys[base_key] = n + 1
         key = base_key if n == 0 else f"{base_key}_{n}"
 
         out[key] = DeviceIdentity(
             key=key,
-            current_mac=d.mac_address,
+            current_mac=mac,
             track_by=track_by,
             hostname=hostname,
+            fingerprint=fingerprint,
+            oui_label=oui,
+            user_alias=user_alias,
         )
     return out
 
@@ -309,31 +496,25 @@ def _existing_trackers_by_key(
     Used during async_setup_entry to update existing entities in place.
     The key here matches the key in _build_identities (hostname or MAC).
     """
-    # Live entities in HA are accessible via entity_registry. We don't
-    # have a direct map of entity_id -> instance, so we walk the
-    # entity_component. This is the same approach used by other
-    # device_tracker integrations.
     from homeassistant.helpers import entity_registry as er
 
     reg = er.async_get(hass)
     out: dict[str, HitronCodaDeviceTracker] = {}
     for ent_reg_entry in reg.entities.values():
         if (
-            ent_reg_entry.config_entry_id == entry_id
-            and ent_reg_entry.platform == DOMAIN
-            and ent_reg_entry.unique_id.startswith(f"{DOMAIN}_host_")
+            ent_reg_entry.config_entry_id != entry_id
+            or ent_reg_entry.platform != DOMAIN
+            or not ent_reg_entry.entity_id.startswith("device_tracker.")
+            or not ent_reg_entry.unique_id.startswith(f"{DOMAIN}_")
         ):
-            # The instance lives in hass.data. We need to look it up by
-            # entity_id. In practice HA's entity_component holds them,
-            # but for the simple case here, we'll resolve by parsing
-            # the unique_id (hostname-based) to a key.
+            continue
+        if ent_reg_entry.unique_id.startswith(f"{DOMAIN}_host_"):
             key = ent_reg_entry.unique_id.removeprefix(f"{DOMAIN}_host_")
-            # Note: we don't actually need the instance — the key alone
-            # is enough to avoid re-adding it. The platform's
-            # async_write_ha_state will be called on the existing
-            # entity via the coordinator's listener mechanism.
-            # We just track the key to know not to add a new one.
-            out[key] = None  # type: ignore[assignment]
+        else:
+            # MAC-keyed fallback unique_id is f"{DOMAIN}_{mac}". The key is
+            # the MAC portion after the underscore.
+            key = ent_reg_entry.unique_id.removeprefix(f"{DOMAIN}_")
+        out[key] = None  # type: ignore[assignment]
     return out
 
 

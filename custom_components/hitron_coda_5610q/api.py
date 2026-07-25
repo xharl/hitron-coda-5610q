@@ -434,7 +434,13 @@ class HitronCodaAPI:
         ]
 
     async def get_dhcp_reservations(self) -> list[dict[str, str]]:
-        """Fetch DHCP reservations."""
+        """Fetch DHCP reservations.
+
+        These are useful because the CODA-5610Q's live host list often
+        reports hostName=\"Unknown\" even when a DHCP reservation has
+        a friendly name. The integration can use reservations as a
+        fallback display name / stable identity.
+        """
         url = self._base / "1/Device/DHCP/Reservation"
         payload = await self._request_json(url)
 

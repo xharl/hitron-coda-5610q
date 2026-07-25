@@ -9,6 +9,6 @@
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/xharl/hitron-coda-5610q/issues",
   "quality_scale": "bronze",
-  "requirements": [],
-  "version": "0.2.14"
+  "requirements": ["zeroconf>=0.132.0"],
+  "version": "0.2.15"
 }

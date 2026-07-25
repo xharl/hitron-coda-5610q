@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import aiohttp
@@ -14,6 +15,8 @@ from homeassistant.config_entries import (
 )
 from homeassistant.helpers.selector import (
     BooleanSelector,
+    SelectSelector,
+    SelectSelectorConfig,
     TextSelector,
     TextSelectorConfig,
     TextSelectorType,
@@ -21,10 +24,15 @@ from homeassistant.helpers.selector import (
 
 from .api import HitronAuthError, HitronConnectionError, HitronCodaAPI
 from .const import (
+    CONF_DEVICE_ALIASES,
+    CONF_ENABLE_MDNS,
     CONF_EXPOSE_DIAGNOSTICS,
     CONF_HOST,
     CONF_PASSWORD,
+    CONF_TRACK_BY,
+    CONF_USE_OUI_LABEL,
     CONF_USERNAME,
+    DEFAULT_TRACK_BY,
     DEFAULT_USERNAME,
     DOMAIN,
 )
@@ -114,7 +122,22 @@ class HitronCodaOptionsFlow(OptionsFlow):
     ) -> ConfigFlowResult:
         """Manage the options."""
         if user_input is not None:
+            # Parse aliases from free-form JSON
+            aliases_raw = user_input.get(CONF_DEVICE_ALIASES, "")
+            aliases: dict[str, str] = {}
+            if aliases_raw:
+                try:
+                    aliases = json.loads(aliases_raw)
+                    if not isinstance(aliases, dict):
+                        raise ValueError("aliases must be an object")
+                except Exception:
+                    # Keep the previous value if invalid
+                    aliases = self._entry.options.get(CONF_DEVICE_ALIASES, {})
+            user_input[CONF_DEVICE_ALIASES] = aliases
             return self.async_create_entry(title="", data=user_input)
+
+        current_aliases = self._entry.options.get(CONF_DEVICE_ALIASES, {})
+        aliases_text = json.dumps(current_aliases, indent=2, ensure_ascii=False) if current_aliases else ""
 
         return self.async_show_form(
             step_id="init",
@@ -126,6 +149,35 @@ class HitronCodaOptionsFlow(OptionsFlow):
                             CONF_EXPOSE_DIAGNOSTICS, False
                         ),
                     ): BooleanSelector(),
+                    vol.Optional(
+                        CONF_TRACK_BY,
+                        default=self._entry.options.get(
+                            CONF_TRACK_BY, DEFAULT_TRACK_BY
+                        ),
+                    ): SelectSelector(
+                        SelectSelectorConfig(
+                            options=["hostname", "mac"],
+                            translation_key="track_by",
+                            multiple=False,
+                        )
+                    ),
+                    vol.Optional(
+                        CONF_ENABLE_MDNS,
+                        default=self._entry.options.get(CONF_ENABLE_MDNS, True),
+                    ): BooleanSelector(),
+                    vol.Optional(
+                        CONF_USE_OUI_LABEL,
+                        default=self._entry.options.get(CONF_USE_OUI_LABEL, True),
+                    ): BooleanSelector(),
+                    vol.Optional(
+                        CONF_DEVICE_ALIASES,
+                        default=aliases_text,
+                    ): TextSelector(
+                        TextSelectorConfig(
+                            type=TextSelectorType.TEXT,
+                            multiline=True,
+                        )
+                    ),
                 }
             ),
         )
