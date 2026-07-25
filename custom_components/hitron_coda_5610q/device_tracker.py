@@ -150,7 +150,8 @@ class DeviceIdentity:
 class HitronCodaDeviceTracker(CoordinatorEntity[HitronCodaCoordinator], ScannerEntity):
     """A device seen on the LAN, identified by hostname in v0.2.13+."""
 
-    _attr_has_entity_name = True
+    # _attr_has_entity_name intentionally NOT set — we define a @property
+    # that always returns False (see property below)
     _attr_source_type = SourceType.ROUTER
     _attr_entity_category = None
 
@@ -349,13 +350,13 @@ async def async_setup_entry(
     fingerprinter = DeviceFingerprinter(hass, entry.options)
 
     host_to_identity = await _build_identities(hass, coordinator, fingerprinter, track_by)
-    _LOGGER.warning(
+    _LOGGER.debug(
         "hitron_coda_5610q device_tracker: built %d identities (track_by=%s)",
         len(host_to_identity),
         track_by,
     )
     for key, ident in list(host_to_identity.items())[:5]:
-        _LOGGER.warning(
+        _LOGGER.debug(
             "  identity key=%s mac=%s hostname=%s alias=%s oui=%s fingerprint=%s",
             key, ident.current_mac, ident.hostname, ident.user_alias, ident.oui_label,
             ident.fingerprint,
@@ -390,10 +391,10 @@ async def async_setup_entry(
     )
     if new_entities:
         try:
-            async_add_entities(new_entities, update_before_add=True)
-            _LOGGER.warning(
+            async_add_entities(new_entities, update_before_add=False)
+            _LOGGER.debug(
                 "hitron_coda_5610q device_tracker: async_add_entities returned, entities now in platform: %s",
-                [e.entity_id for e in new_entities[:3]],
+                [e.entity_id for e in new_entities[:3]] if new_entities else "none",
             )
         except Exception:
             _LOGGER.exception("hitron_coda_5610q device_tracker: async_add_entities failed")
