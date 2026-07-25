@@ -386,6 +386,10 @@ async def async_setup_entry(
     if new_entities:
         try:
             async_add_entities(new_entities, update_before_add=True)
+            _LOGGER.warning(
+                "hitron_coda_5610q device_tracker: async_add_entities returned, entities now in platform: %s",
+                [e.entity_id for e in new_entities[:3]],
+            )
         except Exception:
             _LOGGER.exception("hitron_coda_5610q device_tracker: async_add_entities failed")
 
