@@ -15,6 +15,8 @@ from homeassistant.config_entries import (
 )
 from homeassistant.helpers.selector import (
     BooleanSelector,
+    NumberSelector,
+    NumberSelectorConfig,
     SelectSelector,
     SelectSelectorConfig,
     TextSelector,
@@ -27,11 +29,17 @@ from .const import (
     CONF_DEVICE_ALIASES,
     CONF_ENABLE_MDNS,
     CONF_EXPOSE_DIAGNOSTICS,
+    CONF_FAST_INTERVAL,
     CONF_HOST,
     CONF_PASSWORD,
+    CONF_PRESENCE_GRACE,
+    CONF_SLOW_INTERVAL,
     CONF_TRACK_BY,
     CONF_USE_OUI_LABEL,
     CONF_USERNAME,
+    DEFAULT_FAST_INTERVAL,
+    DEFAULT_PRESENCE_GRACE,
+    DEFAULT_SLOW_INTERVAL,
     DEFAULT_TRACK_BY,
     DEFAULT_USERNAME,
     DOMAIN,
@@ -161,6 +169,18 @@ class HitronCodaOptionsFlow(OptionsFlow):
                             multiple=False,
                         )
                     ),
+                    vol.Optional(
+                        CONF_PRESENCE_GRACE,
+                        default=self._entry.options.get(CONF_PRESENCE_GRACE, DEFAULT_PRESENCE_GRACE),
+                    ): NumberSelector(NumberSelectorConfig(min=0, max=3600, step=30)),
+                    vol.Optional(
+                        CONF_FAST_INTERVAL,
+                        default=self._entry.options.get(CONF_FAST_INTERVAL, DEFAULT_FAST_INTERVAL),
+                    ): NumberSelector(NumberSelectorConfig(min=10, max=300, step=5)),
+                    vol.Optional(
+                        CONF_SLOW_INTERVAL,
+                        default=self._entry.options.get(CONF_SLOW_INTERVAL, DEFAULT_SLOW_INTERVAL),
+                    ): NumberSelector(NumberSelectorConfig(min=60, max=1800, step=30)),
                     vol.Optional(
                         CONF_ENABLE_MDNS,
                         default=self._entry.options.get(CONF_ENABLE_MDNS, True),
