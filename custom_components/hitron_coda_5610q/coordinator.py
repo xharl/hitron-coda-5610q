@@ -224,10 +224,44 @@ class HitronCodaCoordinator(DataUpdateCoordinator[HitronCodaData]):
         # the semaphore in one pass, so trackers see the freshest host
         # list before the slow tier starts.
         try:
-            devices, wifi_clients = await asyncio.gather(
+            # v0.3.1: fast tier gets the same per-endpoint degradation
+            # tolerance as the slow tier — a total firmware degradation
+            # (host list included) must not crash setup/updates; the
+            # trackers' presence grace window covers the gap.
+            fast_results = await asyncio.gather(
                 _bounded(self.api.get_connected_devices()),
                 _bounded(self.api.get_wifi_clients()),
+                return_exceptions=True,
             )
+            _fast_degraded: dict[str, str] = {}
+            _fast_values: dict[str, Any] = {}
+            _fast_first_err: BaseException | None = None
+            for _fname, _res in zip(
+                ("devices", "wifi_clients"), fast_results
+            ):
+                if isinstance(_res, HitronEndpointDegradedError):
+                    _fast_degraded[_fname] = _res.endpoint
+                    _fast_values[_fname] = (
+                        getattr(prev, _fname) if prev is not None else []
+                    )
+                elif isinstance(_res, BaseException):
+                    if _fast_first_err is None:
+                        _fast_first_err = _res
+                else:
+                    _fast_values[_fname] = _res
+            if _fast_degraded:
+                self._apply_degraded_state(_fast_degraded, plane="fast")
+            elif self._degraded:
+                # fast tier was fully probed this cycle; clear its entries
+                self._apply_degraded_state(
+                    {k: v for k, v in self._degraded.items()
+                     if k not in self._FAST_FIELDS},
+                    plane="fast",
+                )
+            if _fast_first_err is not None:
+                raise _fast_first_err
+            devices = _fast_values["devices"]
+            wifi_clients = _fast_values["wifi_clients"]
 
             # ---- slow tier ----
             # The first cycle always does a full fetch (nothing to reuse).
@@ -336,24 +370,46 @@ class HitronCodaCoordinator(DataUpdateCoordinator[HitronCodaData]):
             raise first_error
         return tuple(values[field] for field in fetches)
 
-    def _apply_degraded_state(self, degraded: dict[str, str]) -> None:
-        """Record the degradation observed by the finished slow cycle.
+    _FAST_FIELDS = frozenset({"devices", "wifi_clients"})
+
+    def _apply_degraded_state(
+        self, degraded: dict[str, str], plane: str = "slow"
+    ) -> None:
+        """Record the degradation observed by a finished fetch wave.
 
         ``degraded`` maps HitronCodaData field names to the endpoint
-        path that served HTML. ``_degraded_since`` marks the START of
-        the continuous degradation window and is only cleared by a fully
-        healthy slow cycle — fast-only cycles in between never touch it,
-        so the docsis_data_ok binary sensor reports a stable "off
-        since" even though the DOCSIS endpoints are only re-probed on
-        slow cycles.
+        path that served HTML. Fast-tier endpoints are re-probed every
+        cycle, slow-tier ones only on slow cycles — so each plane's
+        entries are authoritative for that plane and merges never
+        clobber the other plane's state. ``_degraded_since`` marks the
+        START of the continuous degradation window and is only cleared
+        when a plane comes back fully healthy on a cycle that probed
+        it.
         """
+        fresh = dict(self._degraded)
+        if plane == "fast":
+            fresh = {
+                k: v for k, v in fresh.items() if k not in self._FAST_FIELDS
+            }
         if degraded:
             if not self._degraded:
                 self._degraded_since = dt_util.utcnow()
-            self._degraded = dict(degraded)
+            fresh.update(degraded)
+            self._degraded = fresh
         else:
-            self._degraded = {}
-            self._degraded_since = None
+            probed = (
+                self._FAST_FIELDS
+                if plane == "fast"
+                else {f for f, _ in self._SLOW_FETCHERS}
+            )
+            remaining = {
+                k: v
+                for k, v in fresh.items()
+                if k not in probed
+            }
+            self._degraded = remaining
+            if not remaining:
+                self._degraded_since = None
 
     async def async_login_locked(self) -> None:
         """Re-authenticate under the single-flight lock."""

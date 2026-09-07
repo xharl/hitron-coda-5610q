@@ -251,3 +251,30 @@ async def test_mixed_failure_uses_last_good_window_for_hard_errors(make_coordina
     coordinator._cycle = _SLOW_EVERY - 1
     with pytest.raises(UpdateFailed, match="router hiccup"):
         await coordinator._async_update_data()
+
+
+async def test_degraded_fast_tier_on_first_refresh_succeeds(make_coordinator):
+    """Live regression (2026-09-07): the firmware degraded WiFi/Client (fast
+    tier) at the same time as the DOCSIS endpoints, with no last-good data.
+    Setup must survive with empty device lists and record the degradation
+    instead of failing every entity unavailable."""
+    api = _make_api()
+    coordinator = await make_coordinator(api)
+    api.get_connected_devices.side_effect = _degraded("/1/Device/Hosts/1")
+    api.get_wifi_clients.side_effect = _degraded("/1/Device/WiFi/Client")
+    api.get_downstream_channels.side_effect = _degraded(DS_INFO)
+    api.get_upstream_channels.side_effect = _degraded(US_INFO)
+
+    data = await coordinator._async_update_data()
+
+    assert data.devices == []
+    assert data.wifi_clients == []
+    assert data.downstream_channels == []
+    assert coordinator.docsis_degraded is True
+    assert coordinator.degraded_since is not None
+    # docsis_degraded_endpoints filters to the /1/Device/CM/ family — a
+    # degraded host list is a different problem (different remediation)
+    assert set(coordinator.docsis_degraded_endpoints) == {DS_INFO, US_INFO}
+    # the fast-tier degradation is still recorded on the full map
+    assert coordinator.is_degraded("devices")
+    assert coordinator.is_degraded("wifi_clients")
