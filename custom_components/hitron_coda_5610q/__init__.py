@@ -119,7 +119,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        hass.data[DOMAIN].pop(entry.entry_id)
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+        # v0.3.0: drop the live tracker-instance cache on unload. On a
+        # config-entry RELOAD (options change, file redeploy + reload) the
+        # old instances belong to the unloaded coordinator; keeping them
+        # made the re-setup see them as "existing" and add nothing, so
+        # every tracker stayed bound to the dead coordinator → all
+        # unavailable. Fresh setup re-creates them from the sticky store.
+        hass.data[DOMAIN].pop(f"{entry.entry_id}_trackers", None)
     return unload_ok
 
 
