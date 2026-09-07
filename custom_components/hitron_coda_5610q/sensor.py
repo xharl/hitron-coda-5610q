@@ -4,6 +4,12 @@ Exposes router system stats (WAN/LAN uptime, traffic) and device count
 by default. The per-channel DOCSIS power/SNR sensors are opt-in via the
 ``CONF_EXPOSE_DIAGNOSTICS`` config option (default off) — they make
 the entity registry noisy on a healthy cable plant (32+ entities).
+
+v0.3.1: while the modem firmware serves HTML instead of JSON on the
+DOCSIS endpoints, the coordinator keeps serving the last-good channel
+values; the channel sensors flag that with ``docsis_stale`` and
+``last_good`` state attributes so automations can tell held data apart
+from fresh readings.
 """
 from __future__ import annotations
 
@@ -256,6 +262,27 @@ class HitronRouterSensor(CoordinatorEntity[HitronCodaCoordinator], SensorEntity)
         return None
 
 
+def _staleness_attributes(
+    coordinator: HitronCodaCoordinator, field: str
+) -> dict[str, Any]:
+    """Staleness attributes for a sensor backed by a degradable endpoint.
+
+    v0.3.1: during a degradation the backing values come from the
+    coordinator's last-good window. ``docsis_stale`` flags that so
+    automations can distinguish held readings from fresh ones;
+    ``last_good`` says how old the held data actually is.
+    ``docsis_stale`` is always a bool so templates don't need
+    attribute-existence guards.
+    """
+    stale = coordinator.is_degraded(field)
+    attrs: dict[str, Any] = {"docsis_stale": stale}
+    if stale:
+        last_good = coordinator.field_last_good(field)
+        if last_good is not None:
+            attrs["last_good"] = last_good.isoformat()
+    return attrs
+
+
 class HitronDownstreamSensor(CoordinatorEntity[HitronCodaCoordinator], SensorEntity):
     """Per-downstream-channel sensor (SNR or power)."""
 
@@ -295,7 +322,7 @@ class HitronDownstreamSensor(CoordinatorEntity[HitronCodaCoordinator], SensorEnt
         channels = self.coordinator.data.downstream_channels
         if self._channel_index < len(channels):
             ch = channels[self._channel_index]
-            return {
+            attrs: dict[str, Any] = {
                 "frequency": ch.frequency,
                 "modulation": ch.modulation,
                 "channel_id": ch.channel_id,
@@ -303,6 +330,10 @@ class HitronDownstreamSensor(CoordinatorEntity[HitronCodaCoordinator], SensorEnt
                 "correcteds": ch.correcteds,
                 "uncorrectables": ch.uncorrectables,
             }
+            attrs.update(
+                _staleness_attributes(self.coordinator, "downstream_channels")
+            )
+            return attrs
         return {}
 
 
@@ -345,11 +376,15 @@ class HitronUpstreamSensor(CoordinatorEntity[HitronCodaCoordinator], SensorEntit
         channels = self.coordinator.data.upstream_channels
         if self._channel_index < len(channels):
             ch = channels[self._channel_index]
-            return {
+            attrs: dict[str, Any] = {
                 "frequency": ch.frequency,
                 "modulation_type": ch.modulation_type,
                 "channel_id": ch.channel_id,
                 "port_id": ch.port_id,
                 "bandwidth": ch.bandwidth,
             }
+            attrs.update(
+                _staleness_attributes(self.coordinator, "upstream_channels")
+            )
+            return attrs
         return {}

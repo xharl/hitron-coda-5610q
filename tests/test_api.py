@@ -11,10 +11,16 @@ from custom_components.hitron_coda_5610q.api import (
     HitronAuthError,
     HitronCodaAPI,
     HitronConnectionError,
+    HitronEndpointDegradedError,
     SystemInfo,
 )
 
 HOST = "192.168.0.1"
+
+LOGIN_PAGE_HTML = (
+    "<!DOCTYPE html><html><head><title>Hitron CODA-5610Q</title></head>"
+    '<body class="login-page"></body></html>'
+)
 
 
 def load_fixture(name: str) -> dict:
@@ -212,6 +218,138 @@ async def test_login_translates_malformed_json_to_connection_error():
     api = HitronCodaAPI(session, HOST, "cusadmin", "password")
     with pytest.raises(HitronConnectionError, match="Bad login response"):
         await api.login()
+
+
+class _HtmlPageResponse:
+    """Mock aiohttp response whose body is an HTML page (not JSON).
+
+    Mirrors the live v0.3.1 defect: HTTP 200 + the SPA login page on
+    endpoints that normally serve JSON.
+    """
+
+    status = 200
+
+    def __init__(self, body: str = LOGIN_PAGE_HTML):
+        self.headers = MagicMock()
+        self.headers.getall = lambda name, default=[]: default
+        self._body = body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def text(self):
+        return self._body
+
+    async def json(self, content_type=None):
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+
+async def test_html_body_raises_endpoint_degraded_without_relogin():
+    """v0.3.1 regression: a degraded endpoint answers HTTP 200 with the
+    SPA login page instead of JSON. Must raise
+    HitronEndpointDegradedError immediately — no retries and no
+    re-login, because re-login provably does not restore the endpoint.
+    """
+    session = MagicMock()
+    calls = {"get": 0, "post": 0}
+
+    def _get(url, cookies=None, headers=None):
+        calls["get"] += 1
+        return _HtmlPageResponse()
+
+    def _post(url, data=None):
+        calls["post"] += 1
+        return MockResponse({"errCode": "000", "result": "success"})
+
+    session.get = _get
+    session.post = _post
+
+    api = HitronCodaAPI(session, HOST, "cusadmin", "password")
+    from yarl import URL
+
+    url = URL(f"http://{HOST}/1/Device/CM/DsInfo")
+    with pytest.raises(HitronEndpointDegradedError) as excinfo:
+        await api._request_json(url)
+
+    assert excinfo.value.endpoint == "/1/Device/CM/DsInfo"
+    # Fail fast: exactly one GET and no re-login attempts.
+    assert calls["get"] == 1
+    assert calls["post"] == 0
+    # Not classified as an auth error.
+    assert not isinstance(excinfo.value, HitronAuthError)
+
+
+async def test_get_downstream_channels_surfaces_degradation():
+    """The public DOCSIS fetchers propagate the degradation with the
+    endpoint path attached."""
+    session = MagicMock()
+    session.get = lambda url, cookies=None, headers=None: _HtmlPageResponse()
+    session.post = MagicMock(
+        side_effect=AssertionError("re-login must not be attempted")
+    )
+
+    api = HitronCodaAPI(session, HOST, "cusadmin", "password")
+    with pytest.raises(HitronEndpointDegradedError, match="DsInfo"):
+        await api.get_downstream_channels()
+    with pytest.raises(HitronEndpointDegradedError, match="UsInfo"):
+        await api.get_upstream_channels()
+
+
+async def test_html_after_reauth_still_raises_degraded():
+    """A 401 → re-login → HTML sequence must still end in
+    HitronEndpointDegradedError (not a retry loop): the post-re-auth
+    response is guarded too.
+    """
+    session = MagicMock()
+    calls = {"get": 0, "post": 0}
+
+    class _Unauthorized:
+        status = 401
+
+        def __init__(self):
+            self.headers = MagicMock()
+            self.headers.getall = lambda name, default=[]: default
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def text(self):
+            return ""
+
+        async def json(self, content_type=None):
+            return {}
+
+    def _get(url, cookies=None, headers=None):
+        calls["get"] += 1
+        if calls["get"] == 1:
+            return _Unauthorized()
+        return _HtmlPageResponse()
+
+    def _post(url, data=None):
+        calls["post"] += 1
+        return MockResponse(
+            {"errCode": "000", "result": "success"},
+            set_cookie="PHPSESSID=abc123; path=/; HttpOnly",
+        )
+
+    session.get = _get
+    session.post = _post
+
+    api = HitronCodaAPI(session, HOST, "cusadmin", "password")
+    from yarl import URL
+
+    with pytest.raises(HitronEndpointDegradedError, match="UsInfo"):
+        await api._request_json(URL(f"http://{HOST}/1/Device/CM/UsInfo"))
+
+    # One GET, one re-login, one GET after re-auth — then fail fast.
+    assert calls["get"] == 2
+    assert calls["post"] == 1
 
 
 async def test_get_recovers_from_empty_response():

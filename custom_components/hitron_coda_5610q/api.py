@@ -9,8 +9,13 @@ Key findings:
   - Session: PHPSESSID cookie (HttpOnly), GET-only for data endpoints
   - Device list: GET /1/Device/Hosts/1 (the /1 is a page/instance id)
   - DOCSIS: GET /1/Device/CM/DsInfo, /1/Device/CM/UsInfo
-  - POST writes require a csrf token from GET /1/Device/Users/CSRF
-  - Static JS files are at /webpages/js/ and /webpages/lib/ (not /js/, /lib/)
+   - POST writes require a csrf token from GET /1/Device/Users/CSRF
+   - Static JS files are at /webpages/js/ and /webpages/lib/ (not /js/, /lib/)
+   - v0.3.1 firmware defect: the modem intermittently stops serving
+     DOCSIS data — DsInfo/UsInfo answer HTTP 200 with the SPA login
+     page (HTML) instead of JSON while Login and CM/Version keep
+     working. Re-login does NOT clear it, so that case fails fast with
+     HitronEndpointDegradedError instead of retrying.
 """
 from __future__ import annotations
 
@@ -31,6 +36,44 @@ class HitronAuthError(Exception):
 
 class HitronConnectionError(Exception):
     """Raised when the router is unreachable."""
+
+
+class HitronEndpointDegradedError(HitronConnectionError):
+    """Raised when an endpoint serves an HTML page instead of JSON.
+
+    v0.3.1: the CODA-5610Q firmware intermittently stops serving DOCSIS
+    data — DsInfo/UsInfo answer HTTP 200 with the SPA login page while
+    Login and CM/Version keep working. Re-logging in does NOT clear the
+    condition (verified live against a degraded modem), so this error
+    must not trigger the re-auth retry path in ``_request_json``; it is
+    a firmware degradation, not a lost session.
+
+    Subclasses ``HitronConnectionError`` so callers that only care
+    about "the router is not serving data" keep working, while callers
+    that need to single out degradation can catch this first. The
+    ``endpoint`` attribute carries the path of the degraded endpoint so
+    the coordinator can report exactly which endpoints are affected.
+    """
+
+    def __init__(self, message: str, endpoint: str = "") -> None:
+        super().__init__(message)
+        self.endpoint = endpoint
+
+
+def _raise_if_html(url: URL, text: str) -> None:
+    """Raise HitronEndpointDegradedError when the body is an HTML page.
+
+    The router serves its JSON with a Content-Type of text/html, so the
+    header cannot be trusted to detect the degradation — the body must
+    be inspected instead. JSON payloads always start with '{' or '[';
+    the degraded firmware serves the Backbone SPA's login page, which
+    starts with '<'.
+    """
+    if text.lstrip()[:1] == "<":
+        raise HitronEndpointDegradedError(
+            f"{url.path} returned an HTML page instead of JSON",
+            endpoint=url.path,
+        )
 
 
 @dataclass(frozen=True)
@@ -125,6 +168,12 @@ class HitronCodaAPI:
         parallel gather the coordinator runs on first refresh).
         We retry up to 2 times with a short backoff, re-authenticating
         on each attempt since the session cookie may have been lost.
+
+        v0.3.1: an HTML body is different — it means the firmware
+        degraded the endpoint (it serves the SPA login page instead of
+        JSON). That fails fast with ``HitronEndpointDegradedError``:
+        no retries and no re-login, because re-login provably does not
+        restore a degraded endpoint.
         """
         headers = {
             "X-Requested-With": "XMLHttpRequest",
@@ -147,13 +196,21 @@ class HitronCodaAPI:
                                 raise HitronConnectionError(
                                     f"Empty response from {url} after re-auth"
                                 )
+                            _raise_if_html(url, text)
                             return await resp2.json(content_type=None)
                     text = await resp.text()
                     if not text:
                         raise HitronConnectionError(
                             f"Empty response from {url} (status {resp.status})"
                         )
+                    _raise_if_html(url, text)
                     return await resp.json(content_type=None)
+            except HitronEndpointDegradedError:
+                # v0.3.1: firmware degradation, not a lost session —
+                # re-login does not restore the endpoint, so fail fast
+                # instead of burning the retry budget on a hopeless
+                # re-auth cycle.
+                raise
             except (aiohttp.ClientError, HitronConnectionError) as err:
                 last_err = err
                 _LOGGER.debug(

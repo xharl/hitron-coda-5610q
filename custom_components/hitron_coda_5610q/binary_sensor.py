@@ -4,12 +4,17 @@ v0.2.14: dropped the 7 DOCSIS provisioning step sensors. They were always
 on during normal operation and unreachable when the modem was down, so
 they were pure noise.
 
-Exposes firewall status, network access, WiFi radio status, and
-Ethernet port link state.
+Exposes firewall status, network access, WiFi radio status, Ethernet
+port link state, and (v0.3.1) the docsis_data_ok health indicator that
+turns off while the modem firmware serves HTML instead of JSON on its
+DOCSIS endpoints.
 """
 from __future__ import annotations
 
+from typing import Any
+
 from homeassistant.components.binary_sensor import (
+    BinarySensorDeviceClass,
     BinarySensorEntity,
     BinarySensorEntityDescription,
 )
@@ -32,6 +37,19 @@ async def async_setup_entry(
     coordinator: HitronCodaCoordinator = hass.data[DOMAIN][entry.entry_id]
 
     entities: list[BinarySensorEntity] = [
+        # v0.3.1: DOCSIS data health. Turns OFF while the modem firmware
+        # answers the /1/Device/CM/ endpoints with the SPA login page
+        # instead of JSON — the "modem needs a reboot" signal the user
+        # can wire into a notification automation.
+        HitronDocsisOkBinarySensor(
+            coordinator,
+            BinarySensorEntityDescription(
+                key="docsis_data_ok",
+                name="DOCSIS Data OK",
+                device_class=BinarySensorDeviceClass.CONNECTIVITY,
+                icon="mdi:lan-connect",
+            ),
+        ),
         # Network access permitted
         HitronBinarySensor(
             coordinator,
@@ -122,3 +140,49 @@ class HitronBinarySensor(
     @property
     def is_on(self) -> bool:
         return bool(self._value_fn(self.coordinator.data))
+
+
+class HitronDocsisOkBinarySensor(
+    CoordinatorEntity[HitronCodaCoordinator], BinarySensorEntity
+):
+    """DOCSIS data health indicator (v0.3.1).
+
+    On while every /1/Device/CM/ endpoint serves JSON; off once one or
+    more of them answer with the SPA login page instead. The firmware
+    degradation cannot be cleared by re-login — the only remedy we can
+    offer is a modem reboot — so the entity carries the degraded
+    endpoint list and the start of the degradation window as
+    attributes, ready for a notification automation.
+    """
+
+    entity_description: BinarySensorEntityDescription
+
+    def __init__(
+        self,
+        coordinator: HitronCodaCoordinator,
+        description: BinarySensorEntityDescription,
+    ) -> None:
+        super().__init__(coordinator)
+        self.entity_description = description
+        self._attr_unique_id = f"{DOMAIN}_{description.key}"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, self.coordinator.data.system_info.serial_number)},
+            manufacturer=MANUFACTURER,
+            model=MODEL,
+            name="Hitron CODA-5610Q",
+        )
+
+    @property
+    def is_on(self) -> bool:
+        return not self.coordinator.docsis_degraded
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        since = self.coordinator.degraded_since
+        return {
+            "degraded_endpoints": self.coordinator.docsis_degraded_endpoints,
+            "since": since.isoformat() if since else None,
+        }

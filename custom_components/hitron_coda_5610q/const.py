@@ -60,3 +60,20 @@ CONF_FAST_INTERVAL = "fast_interval"
 DEFAULT_FAST_INTERVAL = 30
 CONF_SLOW_INTERVAL = "slow_interval"
 DEFAULT_SLOW_INTERVAL = 300
+
+# v0.3.1: graceful DOCSIS degradation. The modem firmware intermittently
+# stops serving DOCSIS data: the /1/Device/CM/ endpoints answer HTTP 200
+# with the SPA login page (HTML) instead of JSON, while Login and the
+# host list keep working and re-login does NOT clear the condition.
+# These HitronCodaData field names map to endpoints under /1/Device/CM/ —
+# the modem's DOCSIS data plane. While any of them is degraded the
+# coordinator keeps serving the last-good values and the docsis_data_ok
+# binary sensor turns off, so the user can automate a "modem needs a
+# reboot" notification.
+DOCSIS_ENDPOINT_FIELDS = (
+    "system_info",           # GET /1/Device/CM/Version
+    "downstream_channels",   # GET /1/Device/CM/DsInfo
+    "upstream_channels",     # GET /1/Device/CM/UsInfo
+    "docsis_provisioning",   # GET /1/Device/CM/DocsisProvision
+    "cm_sys_info",           # GET /1/Device/CM/SysInfo
+)
