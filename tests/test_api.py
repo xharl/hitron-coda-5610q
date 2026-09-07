@@ -1,4 +1,5 @@
 """Test the API client."""
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -247,11 +248,16 @@ class _HtmlPageResponse:
         raise ValueError("Expecting value: line 1 column 1 (char 0)")
 
 
-async def test_html_body_raises_endpoint_degraded_without_relogin():
-    """v0.3.1 regression: a degraded endpoint answers HTTP 200 with the
-    SPA login page instead of JSON. Must raise
-    HitronEndpointDegradedError immediately — no retries and no
-    re-login, because re-login provably does not restore the endpoint.
+async def test_html_triggers_bounded_relogin_then_degraded():
+    """v0.3.2 regression (the 2026-09-07 wedge): HTML on a request with
+    an expired/missing session must trigger ONE re-login and one retry.
+    Only HTML that survives the fresh login is classified as the
+    HitronEndpointDegradedError firmware degradation.
+
+    Live evidence: the router answers a cookie-less request with
+    HTTP 200 + the SPA login page (never 401/403). v0.3.1 classified
+    that as degradation and never re-logged in, wedging setup on every
+    restart.
     """
     session = MagicMock()
     calls = {"get": 0, "post": 0}
@@ -262,7 +268,10 @@ async def test_html_body_raises_endpoint_degraded_without_relogin():
 
     def _post(url, data=None):
         calls["post"] += 1
-        return MockResponse({"errCode": "000", "result": "success"})
+        return MockResponse(
+            {"errCode": "000", "result": "success"},
+            set_cookie="PHPSESSID=abc123; path=/; HttpOnly",
+        )
 
     session.get = _get
     session.post = _post
@@ -275,21 +284,142 @@ async def test_html_body_raises_endpoint_degraded_without_relogin():
         await api._request_json(url)
 
     assert excinfo.value.endpoint == "/1/Device/CM/DsInfo"
-    # Fail fast: exactly one GET and no re-login attempts.
-    assert calls["get"] == 1
-    assert calls["post"] == 0
-    # Not classified as an auth error.
+    # Bounded: exactly one GET, one re-login, one retry GET. No retry
+    # loop beyond that, and not classified as an auth error.
+    assert calls["get"] == 2
+    assert calls["post"] == 1
     assert not isinstance(excinfo.value, HitronAuthError)
 
 
+async def test_html_recovers_after_relogin_with_fresh_session():
+    """v0.3.2 core recovery: HTML (lost session) → re-login → retry with
+    the fresh PHPSESSID → JSON. This is the exact live failure sequence:
+    boot with no session, every endpoint serving the login page."""
+    session = MagicMock()
+    calls = {"get": 0, "post": 0}
+
+    def _get(url, cookies=None, headers=None):
+        calls["get"] += 1
+        if calls["get"] == 1:
+            return _HtmlPageResponse()
+        return MockResponse({"errCode": "000", "data": "ok"})
+
+    def _post(url, data=None):
+        calls["post"] += 1
+        return MockResponse(
+            {"errCode": "000", "result": "success"},
+            set_cookie="PHPSESSID=fresh; path=/; HttpOnly",
+        )
+
+    session.get = _get
+    session.post = _post
+
+    api = HitronCodaAPI(session, HOST, "cusadmin", "password")
+    from yarl import URL
+
+    result = await api._request_json(URL(f"http://{HOST}/1/Device/Hosts/1"))
+    assert result == {"errCode": "000", "data": "ok"}
+    assert calls["get"] == 2
+    assert calls["post"] == 1
+    # The fresh cookie is stored for subsequent requests.
+    assert api._cookies == {"PHPSESSID": "fresh"}
+
+
+async def test_concurrent_html_responses_trigger_single_login():
+    """All endpoints share one cookie jar, so ONE fresh login fixes every
+    concurrent HTML response in the same gather wave: the throttle must
+    collapse 12 parallel re-login attempts into a single POST."""
+    session = MagicMock()
+    calls = {"get": 0, "post": 0}
+    logged_in = {"flag": False}
+
+    def _get(url, cookies=None, headers=None):
+        calls["get"] += 1
+        if not logged_in["flag"]:
+            return _HtmlPageResponse()
+        return MockResponse({"errCode": "000", "data": "ok"})
+
+    def _post(url, data=None):
+        calls["post"] += 1
+        logged_in["flag"] = True
+        return MockResponse(
+            {"errCode": "000", "result": "success"},
+            set_cookie="PHPSESSID=fresh; path=/; HttpOnly",
+        )
+
+    session.get = _get
+    session.post = _post
+
+    api = HitronCodaAPI(session, HOST, "cusadmin", "password")
+    from yarl import URL
+
+    results = await asyncio.gather(
+        *(
+            api._request_json(URL(f"http://{HOST}/1/Device/EP{i}"))
+            for i in range(6)
+        )
+    )
+    assert all(r == {"errCode": "000", "data": "ok"} for r in results)
+    # One login total — not one per endpoint.
+    assert calls["post"] == 1
+
+
+async def test_keepalive_skips_when_session_fresh():
+    """keepalive() is a no-op while the session is younger than the
+    router's idle expiry (10 min minus margin)."""
+    session = MagicMock()
+    posts = {"n": 0}
+
+    def _post(url, data=None):
+        posts["n"] += 1
+        return MockResponse(
+            {"errCode": "000", "result": "success"},
+            set_cookie="PHPSESSID=abc123; path=/; HttpOnly",
+        )
+
+    session.post = _post
+    api = HitronCodaAPI(session, HOST, "cusadmin", "password")
+    await api.login()
+    assert posts["n"] == 1
+    await api.keepalive()
+    assert posts["n"] == 1  # skipped: fresh session
+
+
+async def test_keepalive_relogins_after_expiry_window():
+    """keepalive() re-logs in when the last login is older than the
+    router's session idle expiry (10 min) minus the margin."""
+    session = MagicMock()
+    posts = {"n": 0}
+
+    def _post(url, data=None):
+        posts["n"] += 1
+        return MockResponse(
+            {"errCode": "000", "result": "success"},
+            set_cookie="PHPSESSID=abc123; path=/; HttpOnly",
+        )
+
+    session.post = _post
+    api = HitronCodaAPI(session, HOST, "cusadmin", "password")
+    await api.login()
+    # Simulate a session that aged past the expiry margin.
+    api._last_login_at -= (10 * 60)  # 10 minutes ago
+    await api.keepalive()
+    assert posts["n"] == 2
+
+
 async def test_get_downstream_channels_surfaces_degradation():
-    """The public DOCSIS fetchers propagate the degradation with the
-    endpoint path attached."""
+    """HTML that survives a fresh login (the genuine v0.3.1 firmware
+    degradation) propagates with the endpoint path attached."""
     session = MagicMock()
     session.get = lambda url, cookies=None, headers=None: _HtmlPageResponse()
-    session.post = MagicMock(
-        side_effect=AssertionError("re-login must not be attempted")
-    )
+
+    def _post(url, data=None):
+        return MockResponse(
+            {"errCode": "000", "result": "success"},
+            set_cookie="PHPSESSID=abc123; path=/; HttpOnly",
+        )
+
+    session.post = _post
 
     api = HitronCodaAPI(session, HOST, "cusadmin", "password")
     with pytest.raises(HitronEndpointDegradedError, match="DsInfo"):

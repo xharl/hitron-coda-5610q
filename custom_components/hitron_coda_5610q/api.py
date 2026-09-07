@@ -11,16 +11,26 @@ Key findings:
   - DOCSIS: GET /1/Device/CM/DsInfo, /1/Device/CM/UsInfo
    - POST writes require a csrf token from GET /1/Device/Users/CSRF
    - Static JS files are at /webpages/js/ and /webpages/lib/ (not /js/, /lib/)
-   - v0.3.1 firmware defect: the modem intermittently stops serving
-     DOCSIS data — DsInfo/UsInfo answer HTTP 200 with the SPA login
-     page (HTML) instead of JSON while Login and CM/Version keep
-     working. Re-login does NOT clear it, so that case fails fast with
-     HitronEndpointDegradedError instead of retrying.
+   - Session: PHPSESSID expires server-side after 10 idle minutes
+     (mainApp.js: SessionTimeout = 10 * 60, kept alive by the SPA's
+     Users/Alive heartbeat).
+   - CRITICAL (v0.3.2, verified live + via browser HAR): the router
+     signals a missing/expired session with HTTP 200 + the SPA login
+     page (HTML) — never with 401/403. v0.3.1 misread every HTML body
+     as "firmware degraded the endpoint" and stopped re-logging in,
+     wedging the integration after every restart (the API client never
+     held a valid session). The HTML response is now treated as a lost
+     session first: one bounded re-login (throttled to one attempt per
+     minute across all endpoints) + one retry. Only HTML that survives
+     a fresh login is classified as the genuine firmware degradation
+     (HitronEndpointDegradedError), which re-login provably does not
+     clear.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,6 +38,12 @@ import aiohttp
 from yarl import URL
 
 _LOGGER = logging.getLogger(__name__)
+
+# v0.3.2: session lifecycle constants, from the router's own SPA
+# (mainApp.js: SessionTimeout = 10 * 60 seconds, kept alive by a
+# Users/Alive heartbeat).
+_SESSION_IDLE_EXPIRY = 10 * 60          # router kills idle sessions after 10 min
+_RELOGIN_MIN_INTERVAL = 60              # min spacing between re-login attempts
 
 
 class HitronAuthError(Exception):
@@ -41,18 +57,17 @@ class HitronConnectionError(Exception):
 class HitronEndpointDegradedError(HitronConnectionError):
     """Raised when an endpoint serves an HTML page instead of JSON.
 
-    v0.3.1: the CODA-5610Q firmware intermittently stops serving DOCSIS
-    data — DsInfo/UsInfo answer HTTP 200 with the SPA login page while
-    Login and CM/Version keep working. Re-logging in does NOT clear the
-    condition (verified live against a degraded modem), so this error
-    must not trigger the re-auth retry path in ``_request_json``; it is
-    a firmware degradation, not a lost session.
-
-    Subclasses ``HitronConnectionError`` so callers that only care
-    about "the router is not serving data" keep working, while callers
-    that need to single out degradation can catch this first. The
-    ``endpoint`` attribute carries the path of the degraded endpoint so
-    the coordinator can report exactly which endpoints are affected.
+    v0.3.2 reclassification (verified live + browser HAR): the router
+    serves the SPA login page BOTH when the session is missing/expired
+    AND during the genuine firmware degradation. The difference is only
+    observable after a fresh login: an expired session returns JSON for
+    the new PHPSESSID, a degraded endpoint keeps serving HTML. The API
+    client therefore tries one bounded re-login on HTML
+    (``_request_json``) and only raises this error when HTML survives a
+    fresh session — the v0.3.1-verified condition that re-login does
+    not clear. The ``endpoint`` attribute carries the path of the
+    affected endpoint so the coordinator can report exactly which
+    endpoints are degraded.
     """
 
     def __init__(self, message: str, endpoint: str = "") -> None:
@@ -150,13 +165,29 @@ class HitronCodaAPI:
         # per login; overlapping logins (e.g. 12 parallel request retries)
         # invalidate each other's session and cause 401 storms.
         self._login_lock = asyncio.Lock()
+        # v0.3.2: login bookkeeping for the HTML→re-login path.
+        # _last_login_at throttles re-login storms (one attempt per
+        # minute): all endpoints share one cookie jar (self._cookies is
+        # passed to every GET), so ONE fresh login fixes every
+        # concurrent HTML response in the same gather wave — later
+        # callers see a fresh timestamp and skip straight to retrying
+        # with the new cookie. Initialized to the far past so the first
+        # keepalive/HTML recovery on a fresh process actually logs in.
+        self._last_login_at: float = -(_SESSION_IDLE_EXPIRY + 1)
 
     async def _request_json(self, url: URL) -> dict[str, Any]:
         """GET an endpoint and return parsed JSON.
 
         The router returns Content-Type: text/html for JSON, so we
-        must use content_type=None. If the response looks like a
-        login page redirect, we re-login once.
+        must use content_type=None.
+
+        v0.3.2 session model (verified live + HAR): the router never
+        sends 401/403 — an expired/missing session answers HTTP 200
+        with the SPA login page. That HTML body is a lost session
+        until proven otherwise: one bounded re-login (throttled across
+        endpoints) + one retry. Only HTML that persists after a fresh
+        login is the real firmware degradation
+        (``HitronEndpointDegradedError``), which re-login cannot clear.
 
         Any aiohttp client error (timeout, connection refused, DNS
         failure, etc.) is translated into ``HitronConnectionError`` so
@@ -168,12 +199,6 @@ class HitronCodaAPI:
         parallel gather the coordinator runs on first refresh).
         We retry up to 2 times with a short backoff, re-authenticating
         on each attempt since the session cookie may have been lost.
-
-        v0.3.1: an HTML body is different — it means the firmware
-        degraded the endpoint (it serves the SPA login page instead of
-        JSON). That fails fast with ``HitronEndpointDegradedError``:
-        no retries and no re-login, because re-login provably does not
-        restore a degraded endpoint.
         """
         headers = {
             "X-Requested-With": "XMLHttpRequest",
@@ -186,7 +211,9 @@ class HitronCodaAPI:
                     url, cookies=self._cookies, headers=headers
                 ) as resp:
                     if resp.status in (401, 403):
-                        # Session expired — re-login (single-flight) and retry
+                        # Belt-and-braces: some firmware variants do
+                        # signal expiry with 401/403 — re-login and
+                        # retry once inside this attempt.
                         await self.login()
                         async with self._session.get(
                             url, cookies=self._cookies, headers=headers
@@ -203,15 +230,35 @@ class HitronCodaAPI:
                         raise HitronConnectionError(
                             f"Empty response from {url} (status {resp.status})"
                         )
-                    _raise_if_html(url, text)
+                    if text.lstrip()[:1] == "<":
+                        # v0.3.2: HTML body = lost session until proven
+                        # otherwise (the router answers expired/missing
+                        # sessions with HTTP 200 + login page, never
+                        # 401/403 — verified live + HAR). One bounded
+                        # re-login, then one retry with the fresh
+                        # cookie. Only HTML that survives a FRESH login
+                        # is classified as the genuine firmware
+                        # degradation.
+                        await self._ensure_fresh_login()
+                        async with self._session.get(
+                            url, cookies=self._cookies, headers=headers
+                        ) as resp2:
+                            text2 = await resp2.text()
+                            if not text2:
+                                raise HitronConnectionError(
+                                    f"Empty response from {url} after re-login"
+                                )
+                            if text2.lstrip()[:1] == "<":
+                                raise HitronEndpointDegradedError(
+                                    f"{url.path} returned an HTML page "
+                                    "instead of JSON",
+                                    endpoint=url.path,
+                                )
+                            return await resp2.json(content_type=None)
                     return await resp.json(content_type=None)
             except HitronEndpointDegradedError:
-                # v0.3.1: firmware degradation, not a lost session —
-                # re-login does not restore the endpoint, so fail fast
-                # instead of burning the retry budget on a hopeless
-                # re-auth cycle.
                 raise
-            except (aiohttp.ClientError, HitronConnectionError) as err:
+            except (aiohttp.ClientError, HitronConnectionError, ValueError) as err:
                 last_err = err
                 _LOGGER.debug(
                     "HitronCodaAPI: GET %s failed (attempt %d/3): %s",
@@ -220,19 +267,6 @@ class HitronCodaAPI:
                 # Re-login before retrying in case the session died.
                 # v0.3.0: under the single-flight lock so overlapping
                 # retries can't invalidate each other's PHPSESSID.
-                try:
-                    await self.login()
-                except Exception:
-                    pass
-            except (ValueError, KeyError, TypeError) as err:
-                # JSON parse error — the body was not JSON (e.g. router
-                # returned the login HTML). Treat as a transient error
-                # and retry after re-authenticating.
-                last_err = err
-                _LOGGER.debug(
-                    "HitronCodaAPI: GET %s returned bad JSON (attempt %d/3): %s",
-                    url, attempt + 1, err,
-                )
                 try:
                     await self.login()
                 except Exception:
@@ -248,6 +282,39 @@ class HitronCodaAPI:
         """Single-flight re-auth (v0.3.0). Serializes under _login_lock."""
         async with self._login_lock:
             await self._login_impl()
+
+    async def _ensure_fresh_login(self) -> None:
+        """Throttled re-login for the HTML→recovery path (v0.3.2).
+
+        All endpoints share one aiohttp session and one cookie jar
+        (``self._cookies`` is passed to every GET), so ONE fresh login
+        fixes every concurrent HTML response in the same gather wave.
+        The throttle prevents 12 parallel endpoints from issuing 12
+        logins — the CODA invalidates overlapping sessions (fresh
+        PHPSESSID per login). Under the single-flight lock the first
+        caller logs in; the rest see a fresh ``_last_login_at`` and
+        skip straight to retrying with the new cookie.
+        """
+        async with self._login_lock:
+            now = time.monotonic()
+            if (now - self._last_login_at) < _RELOGIN_MIN_INTERVAL:
+                # Someone (another endpoint in this wave) just logged in.
+                return
+            await self._login_impl()
+
+    async def keepalive(self) -> None:
+        """Refresh the session without hitting a data endpoint (v0.3.2).
+
+        The browser SPA sends GET /1/Device/Users/Alive every ~15s to
+        keep its session open (SessionTimeout = 10 idle minutes in
+        mainApp.js). Callers that cannot heartbeat that fast should call
+        this on an interval well under the router's session expiry; it
+        is a no-op when a login happened more recently than the
+        router's session expiry.
+        """
+        if (time.monotonic() - self._last_login_at) < _SESSION_IDLE_EXPIRY - 60:
+            return
+        await self.login()
 
     async def _login_impl(self) -> None:
         """Authenticate and store the session cookie.
@@ -300,6 +367,9 @@ class HitronCodaAPI:
             if name.strip() == "PHPSESSID":
                 value = rest.split(";", 1)[0].strip()
                 self._cookies = {"PHPSESSID": value}
+                # v0.3.2: stamp the login time for the re-login throttle
+                # and the keepalive interval.
+                self._last_login_at = time.monotonic()
                 return
         raise HitronAuthError("No PHPSESSID cookie set")
 

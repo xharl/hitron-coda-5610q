@@ -1,6 +1,40 @@
 # Changelog
 
-## 0.2.14 — 2026-07-13
+## 0.3.2 — 2026-09-07
+
+### Fixed
+- **Boot wedge: the integration never re-authenticated.** Verified live
+  and via a browser HAR: the CODA signals a missing/expired session
+  with HTTP 200 + the SPA login page — never 401/403. v0.3.1
+  classified every HTML body as "firmware degradation, do not
+  re-login", so after any restart the API client ran session-less,
+  every endpoint returned the login page, the device list stayed
+  empty, and all device trackers froze `unavailable` until the next
+  restart. HTML now triggers one bounded re-login (throttled to one
+  attempt per minute; all endpoints share the resulting fresh cookie)
+  plus one retry. Only HTML that survives a fresh login is classified
+  as the genuine firmware degradation (`HitronEndpointDegradedError`).
+- **Boot login.** The coordinator logs in explicitly before the first
+  data fetch, so setup starts with a valid session instead of relying
+  on luck.
+- **Refresh loop no longer dies.** The parent coordinator's
+  reschedule is gated on listeners and its timer chain stopped twice
+  in production a few cycles after setup, freezing every entity
+  (timestamps frozen at the last write). The coordinator now owns an
+  explicit poll loop for the lifetime of the config entry (fast-tier
+  cadence, errors caught and logged per cycle) and disables the
+  legacy timer chain.
+- **Router session keepalive.** The SPA keeps its session alive with a
+  Users/Alive heartbeat (SessionTimeout = 10 idle minutes in
+  mainApp.js). The poll loop sends the same keepalive before each
+  cycle, so sessions at scan intervals ≥ 10 minutes no longer expire
+  between polls.
+- **Trackers self-heal after an empty boot.** Platform setup against
+  an empty device list no longer strands the registry entities: a
+  coordinator watcher adopts entities the moment real device data
+  arrives — no reload or restart needed.
+
+## 0.3.1 — 2026-09-06
 
 ### Changed
 - **Per-channel DOCSIS power/SNR sensors are now opt-in.** The

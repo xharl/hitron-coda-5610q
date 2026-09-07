@@ -12,17 +12,20 @@ than a raw MAC string. These tests use a small helper to build
 """
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import MagicMock
 
 from homeassistant.components.device_tracker import SourceType
 from homeassistant.const import STATE_HOME, STATE_NOT_HOME
 import pytest
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.hitron_coda_5610q.api import ConnectedDevice, SystemInfo
 from custom_components.hitron_coda_5610q.const import DOMAIN
 from custom_components.hitron_coda_5610q.device_tracker import (
     DeviceIdentity,
     HitronCodaDeviceTracker,
+    async_setup_entry,
     make_entity_unique_id,
 )
 
@@ -189,3 +192,74 @@ async def test_router_pause_is_immediate_not_home():
     coord.presence_grace = 240
     tracker = HitronCodaDeviceTracker(coord, _identity(mac, "phone"))
     assert tracker.state == STATE_NOT_HOME
+
+
+# ---- v0.3.2: empty→non-empty entity adoption ----
+
+
+async def test_setup_with_devices_adds_entities(hass):
+    """Guard: a healthy setup still adopts entities immediately."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={"host": "192.168.0.1", "username": "cusadmin", "password": "pw"},
+    )
+    entry.add_to_hass(hass)
+    coord = _make_coordinator(
+        [_device("AA:BB:CC:DD:EE:01", True, "pixel-6"),
+         _device("AA:BB:CC:DD:EE:02", True, "watch")]
+    )
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coord
+
+    added: list = []
+
+    def _add(new_entities, update_before_add=False):
+        added.extend(new_entities)
+
+    await async_setup_entry(hass, entry, _add)
+    assert len(added) == 2
+
+
+async def test_empty_setup_adopts_when_data_arrives(hass):
+    """v0.3.2 regression (the 2026-09-07 wedge): platform setup against
+    an empty device list must NOT be terminal — when real device data
+    arrives, the watcher adopts the entities without a reload."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={"host": "192.168.0.1", "username": "cusadmin", "password": "pw"},
+    )
+    entry.add_to_hass(hass)
+    coord = _make_coordinator([])  # boot with empty device list
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coord
+
+    added: list = []
+
+    def _add(new_entities, update_before_add=False):
+        added.extend(new_entities)
+
+    await async_setup_entry(hass, entry, _add)
+    assert added == []  # nothing to add yet
+
+    # The watcher registered a coordinator listener.
+    listener = coord.async_add_listener.call_args[0][0]
+
+    # Device data arrives (router recovered).
+    coord.data.devices = [_device("AA:BB:CC:DD:EE:FF", True, "pixel-6")]
+    listener()
+    # Adoption runs in a background task; wait for it deterministically.
+    deadline = 2.0
+    while not added and deadline > 0:
+        await asyncio.sleep(0.05)
+        deadline -= 0.05
+    await hass.async_block_till_done()
+
+    assert len(added) == 1
+    assert added[0]._identity.key == "pixel-6"
+
+    # Further listener fires are no-ops (entities already adopted).
+    coord.data.devices = [
+        _device("AA:BB:CC:DD:EE:FF", True, "pixel-6"),
+        _device("AA:BB:CC:DD:EE:02", True, "watch"),
+    ]
+    listener()
+    await hass.async_block_till_done()
+    assert len(added) == 1  # no duplicates

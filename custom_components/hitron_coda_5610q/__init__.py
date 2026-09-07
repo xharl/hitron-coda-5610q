@@ -66,6 +66,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
         coordinator = HitronCodaCoordinator(hass, entry, api, scan_interval)
+        _LOGGER.debug("hitron_coda_5610q: logging in")
+        # v0.3.2: explicit login BEFORE the first data fetch. The CODA
+        # answers a cookie-less request with the SPA login page (HTML),
+        # never 401/403 — verified live + browser HAR. Without this,
+        # boot-time setup ran with no session: every endpoint returned
+        # HTML-as-degraded, the device list stayed empty, and the whole
+        # integration wedged until the next restart.
+        await api.login()
         _LOGGER.debug("hitron_coda_5610q: starting first refresh")
         await coordinator.async_config_entry_first_refresh()
         _LOGGER.debug("hitron_coda_5610q: first refresh OK")
@@ -89,17 +97,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
         _LOGGER.debug("hitron_coda_5610q: forwards OK")
 
-        # Re-schedule the periodic update loop now that all entity
-        # platforms have registered their listeners. The first
-        # _schedule_refresh in the coordinator's __init__ installed
-        # a timer, but at that time self._listeners was empty (the
-        # first refresh's finally block then sees the empty dict and
-        # would not re-schedule). Now that the platform entities
-        # exist and have subscribed, the listeners set is non-empty
-        # and the loop will keep running.
-        coordinator._schedule_refresh()
+        # v0.3.2: start the explicit polling loop. This replaces the
+        # v0.2.x-era double _schedule_refresh() hack: the parent's
+        # reschedule is listener-gated and the timer chain died twice in
+        # production (2026-09-07), freezing every entity. The owned loop
+        # refreshes on the fast cadence and sends the router keepalive,
+        # and survives listenerless windows by construction.
+        coordinator.start_polling()
 
         entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+
+        # v0.3.2: stop the poll loop when the entry is unloaded; the
+        # session closes when HA itself shuts down.
+        entry.async_on_unload(coordinator.stop_polling)
 
         # Close the session when the entry is unloaded
         async def _close_session(event):
@@ -119,6 +129,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        # v0.3.2: stop + await the explicit poll loop before dropping
+        # the coordinator, so no cycle can run against a torn-down hass.
+        coordinator = hass.data[DOMAIN].get(entry.entry_id)
+        if coordinator is not None:
+            coordinator.stop_polling()
+            poll_task = coordinator._poll_task
+            if poll_task is not None:
+                try:
+                    await asyncio.wait_for(poll_task, timeout=5)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
         hass.data[DOMAIN].pop(entry.entry_id, None)
         # v0.3.0: drop the live tracker-instance cache on unload. On a
         # config-entry RELOAD (options change, file redeploy + reload) the

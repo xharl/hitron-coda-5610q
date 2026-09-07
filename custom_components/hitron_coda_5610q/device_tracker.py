@@ -366,6 +366,11 @@ async def async_setup_entry(
     hostname when available; otherwise a fingerprint-based key (mDNS,
     NetBIOS, SSDP, user alias, or MAC fallback). MAC rotation is
     handled by updating `current_mac` on existing entities.
+
+    v0.3.2: entity adoption is no longer setup-only. If the platform
+    set up against an empty device list (router unreachable at boot),
+    the coordinator watcher adopts entities the moment real device
+    data arrives — no reload/restart needed.
     """
     coordinator: HitronCodaCoordinator = hass.data[DOMAIN][entry.entry_id]
     track_by = entry.options.get("track_by", "hostname")
@@ -377,7 +382,76 @@ async def async_setup_entry(
     await store.async_load()
     coordinator.identity_store = store  # type: ignore[attr-defined]
 
-    host_to_identity = await _build_identities(hass, coordinator, fingerprinter, track_by, store)
+    # Keep a per-entry map of live tracker instances so we can update
+    # their MAC in place when a device reconnects under a new MAC.
+    tracker_store_key = f"{entry.entry_id}_trackers"
+    if tracker_store_key not in hass.data[DOMAIN]:
+        hass.data[DOMAIN][tracker_store_key] = {}
+    tracker_store: dict[str, HitronCodaDeviceTracker] = hass.data[DOMAIN][tracker_store_key]
+
+    await _sync_tracker_entities(
+        hass, coordinator, entry, fingerprinter, track_by,
+        store, tracker_store, async_add_entities,
+    )
+
+    # v0.3.2: empty→non-empty adoption watcher. The identity build at
+    # platform setup produces zero entities when the device list is
+    # empty (e.g. the router is briefly unreachable during HA boot);
+    # without this watcher those entities never get created until the
+    # next restart/reload. Watch the coordinator: the moment real
+    # device data exists and no entities are live, adopt them.
+    adopt_in_flight = False
+
+    def _reconcile() -> None:
+        nonlocal adopt_in_flight
+        if adopt_in_flight or tracker_store:
+            return
+        if not coordinator.data or not coordinator.data.devices:
+            return
+        adopt_in_flight = True
+        _LOGGER.warning(
+            "hitron_coda_5610q device_tracker: device data available "
+            "(%d devices); adopting tracker entities",
+            len(coordinator.data.devices),
+        )
+
+        async def _adopt() -> None:
+            nonlocal adopt_in_flight
+            try:
+                await _sync_tracker_entities(
+                    hass, coordinator, entry, fingerprinter, track_by,
+                    store, tracker_store, async_add_entities,
+                )
+            finally:
+                adopt_in_flight = False
+
+        entry.async_create_background_task(
+            hass, _adopt(), name="hitron_coda_5610q tracker adopt",
+            eager_start=True,
+        )
+
+    entry.async_on_unload(coordinator.async_add_listener(_reconcile))
+
+
+async def _sync_tracker_entities(
+    hass: HomeAssistant,
+    coordinator: HitronCodaCoordinator,
+    entry: ConfigEntry,
+    fingerprinter: DeviceFingerprinter,
+    track_by: str,
+    store: IdentityStore,
+    tracker_store: dict[str, "HitronCodaDeviceTracker"],
+    async_add_entities: AddEntitiesCallback,
+) -> list["HitronCodaDeviceTracker"]:
+    """Build identities from current coordinator data and adopt entities.
+
+    Shared by platform setup and the v0.3.2 empty→non-empty reconcile:
+    persists newly learned MAC→key mappings, updates MAC-rotation on
+    existing live entities, and adds entities for unseen identity keys.
+    """
+    host_to_identity = await _build_identities(
+        hass, coordinator, fingerprinter, track_by, store
+    )
     _LOGGER.debug(
         "hitron_coda_5610q device_tracker: built %d identities (track_by=%s)",
         len(host_to_identity),
@@ -394,13 +468,6 @@ async def async_setup_entry(
             ident.fingerprint,
         )
 
-    # Keep a per-entry map of live tracker instances so we can update
-    # their MAC in place when a device reconnects under a new MAC.
-    tracker_store_key = f"{entry.entry_id}_trackers"
-    if tracker_store_key not in hass.data[DOMAIN]:
-        hass.data[DOMAIN][tracker_store_key] = {}
-    tracker_store: dict[str, HitronCodaDeviceTracker] = hass.data[DOMAIN][tracker_store_key]
-
     new_entities: list[HitronCodaDeviceTracker] = []
     for key, identity in host_to_identity.items():
         tracker = tracker_store.get(key)
@@ -411,9 +478,8 @@ async def async_setup_entry(
             )
             tracker._identity = identity
             tracker.async_write_ha_state()
-            if store is not None:
-                store.remember(identity.current_mac, key)
-                await store.async_save()
+            store.remember(identity.current_mac, key)
+            await store.async_save()
         elif tracker is None:
             tracker = HitronCodaDeviceTracker(coordinator, identity)
             tracker_store[key] = tracker
@@ -433,6 +499,7 @@ async def async_setup_entry(
             )
         except Exception:
             _LOGGER.exception("hitron_coda_5610q device_tracker: async_add_entities failed")
+    return new_entities
 
 
 async def _build_identities(

@@ -40,7 +40,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import (
     ConfigEntryAuthFailed,
     DataUpdateCoordinator,
@@ -93,7 +93,18 @@ class HitronCodaData:
 
 
 class HitronCodaCoordinator(DataUpdateCoordinator[HitronCodaData]):
-    """Single coordinator shared by all entity platforms."""
+    """Single coordinator shared by all entity platforms.
+
+    v0.3.2: owns an explicit polling loop instead of relying on HA's
+    listener-gated reschedule chain. Live evidence (2026-09-07): the
+    parent ``_async_refresh`` only re-schedules when ``self._listeners``
+    is non-empty, and the chain died twice in production a few cycles
+    after setup even with entities registered — leaving every entity
+    frozen. The explicit loop (``start_polling``) runs for the lifetime
+    of the config entry, refreshes on the fast-tier cadence, and sends
+    the router keepalive; ``update_interval`` is set to None so the
+    parent never schedules a competing timer chain.
+    """
 
     config_entry: ConfigEntry
 
@@ -189,9 +200,15 @@ class HitronCodaCoordinator(DataUpdateCoordinator[HitronCodaData]):
         # other's session and cause 401 storms under load.
         self._login_lock = asyncio.Lock()
 
-        # Keep the legacy behavior: schedule the loop immediately so the
-        # periodic refresh survives the listenerless first-refresh window.
-        self._schedule_refresh()
+        # v0.3.2: explicit polling loop (see class docstring). Owned by
+        # the config entry, torn down on unload/restart.
+        self._poll_task: asyncio.Task | None = None
+        self._poll_stopped = asyncio.Event()
+
+        # NOTE: no legacy self._schedule_refresh() here. The v0.2.x-era
+        # timer chain was listener-gated and died twice in production;
+        # with the explicit poll loop in start_polling() a stray armed
+        # timer would only risk a concurrent refresh against the router.
 
     def _interval_opt(self, key: str, default: int, lo: int, hi: int) -> int:
         try:
@@ -415,6 +432,85 @@ class HitronCodaCoordinator(DataUpdateCoordinator[HitronCodaData]):
         """Re-authenticate under the single-flight lock."""
         async with self._login_lock:
             await self.api.login()
+
+    # ---- v0.3.2: explicit polling loop ----
+
+    @callback
+    def start_polling(self) -> None:
+        """Start the explicit polling loop (idempotent).
+
+        Runs for the lifetime of the config entry. Disables the parent
+        timer chain (update_interval = None) so the two mechanisms never
+        double-poll; the parent's ``_async_refresh`` reschedule then
+        becomes a no-op for the timer path (its ``finally`` only
+        reschedules when ``_listeners`` exist, and ``_unsub_refresh``
+        stays None so nothing new is armed by the parent).
+        """
+        if self._poll_task is not None and not self._poll_task.done():
+            return
+        self._poll_stopped.clear()
+        self.update_interval = None  # parent timer chain off
+        self._async_unsub_refresh()  # cancel any legacy scheduled timer
+        self._debounced_refresh.async_cancel()
+        self._poll_task = self.config_entry.async_create_background_task(
+            self.hass,
+            self._poll_loop(),
+            name=f"{DOMAIN} - poll loop",
+            eager_start=True,
+        )
+        _LOGGER.info("hitron: explicit poll loop started")
+
+    def stop_polling(self) -> None:
+        """Signal the poll loop to stop (task awaited on unload)."""
+        self._poll_stopped.set()
+
+    async def async_shutdown(self) -> None:
+        """Stop the poll loop, then run the parent shutdown (v0.3.2)."""
+        self.stop_polling()
+        poll_task = self._poll_task
+        if poll_task is not None and not poll_task.done():
+            try:
+                await asyncio.wait_for(poll_task, timeout=5)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+        await super().async_shutdown()
+
+    async def _poll_loop(self) -> None:
+        """Refresh on the fast-tier cadence, with router keepalive.
+
+        Errors are caught and logged: the loop must never die from a
+        single failed cycle (that is exactly the failure mode this
+        replaces). On UpdateFailed the next iteration retries after the
+        fast interval, so recovery requires no entity reloads.
+        """
+        _LOGGER.info(
+            "hitron: poll loop running (fast=%ds slow=%ds)",
+            self._fast_interval, self._slow_interval,
+        )
+        while not self._poll_stopped.is_set():
+            started = time.monotonic()
+            try:
+                # Keepalive is a no-op when the session is younger than
+                # the router's idle expiry (10 min - 60s margin).
+                await self.api.keepalive()
+                # Serialize with the debounced-refresh path exactly like
+                # the parent's _handle_refresh_interval does, so a stray
+                # scheduled refresh can never run concurrently with the
+                # loop (overlapping cycles issue overlapping logins).
+                async with self._debounced_refresh.async_lock():
+                    await self._async_refresh(log_failures=True, scheduled=True)
+            except Exception:  # noqa: BLE001 - loop must survive anything
+                _LOGGER.exception("hitron: poll cycle failed")
+            # Sleep out the remainder of the fast interval.
+            elapsed = time.monotonic() - started
+            sleep_s = max(0.0, self._fast_interval - elapsed)
+            try:
+                await asyncio.wait_for(
+                    self._poll_stopped.wait(), timeout=sleep_s
+                )
+            except asyncio.TimeoutError:
+                pass
+        _LOGGER.info("hitron: poll loop stopped")
 
     @property
     def slow_interval(self) -> int:
