@@ -10,6 +10,7 @@ v0.3.0 failure semantics for every other error class.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -278,3 +279,49 @@ async def test_degraded_fast_tier_on_first_refresh_succeeds(make_coordinator):
     # the fast-tier degradation is still recorded on the full map
     assert coordinator.is_degraded("devices")
     assert coordinator.is_degraded("wifi_clients")
+
+
+# ---- v0.3.2: explicit polling loop ----
+
+
+async def test_poll_loop_refreshes_and_survives_errors(make_coordinator):
+    """The explicit loop must refresh on the fast cadence and keep
+    running through failed cycles — the live failure mode was a dead
+    timer chain leaving every entity frozen."""
+    coordinator = await make_coordinator(_make_api())
+    coordinator.start_polling()
+    try:
+        assert coordinator._poll_task is not None
+        assert not coordinator._poll_task.done()
+        assert coordinator.update_interval is None
+        # Idempotent start.
+        first_task = coordinator._poll_task
+        coordinator.start_polling()
+        assert coordinator._poll_task is first_task
+
+        # A failing cycle must not kill the loop.
+        coordinator.api.get_connected_devices.side_effect = HitronConnectionError(
+            "router hiccup"
+        )
+        await asyncio.sleep(0.05)
+        assert not coordinator._poll_task.done()
+
+        # ...and the next cycle succeeds again.
+        coordinator.api.get_connected_devices.side_effect = None
+        await asyncio.sleep(0.1)
+        assert not coordinator._poll_task.done()
+    finally:
+        coordinator.stop_polling()
+        await coordinator.async_shutdown()
+    assert coordinator._poll_task.done()
+
+
+async def test_poll_loop_stops_via_event(make_coordinator):
+    """stop_polling() ends the loop promptly."""
+    coordinator = await make_coordinator(_make_api())
+    coordinator.start_polling()
+    await asyncio.sleep(0.05)
+    assert not coordinator._poll_task.done()
+    coordinator.stop_polling()
+    await asyncio.wait_for(coordinator._poll_task, timeout=5)
+    assert coordinator._poll_task.done()
