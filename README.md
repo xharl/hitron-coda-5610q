@@ -14,6 +14,20 @@ with this model.
 - **Hostname-based identity** (v0.2.13+) — survives MAC rotation
   (iOS Private WiFi Address, Android 10+ randomized MACs) so a phone
   that rotates its MAC every few hours keeps a stable entity_id
+- **Presence hysteresis** (v0.3.0+) — a device stays `home` for a
+  configurable grace window (default 240 s, option
+  `presence_grace_seconds`) after last appearing in the router's host
+  list. This absorbs the CODA's transient host-list drops (WiFi
+  power-save, band steering) that previously caused instant `not_home`
+  flapping. A router-reported Pause still applies immediately.
+- **Sticky identity store** (v0.3.0+) — MAC → identity mappings persist
+  in HA storage across restarts; router hostname flaps no longer create
+  duplicate entities
+- **Tiered polling** (v0.3.0+) — presence-critical endpoints (host list,
+  WiFi clients) poll every `fast_interval` (30 s); DOCSIS/diagnostic
+  endpoints refresh every `slow_interval` (300 s), cutting router load
+  ~3×. On a router failure, the last good data is served for up to 3
+  cycles before entities are marked unavailable.
 - Per-device WiFi band, SSID, bitrate, channel, signal strength as
   extra attributes (when the router reports them)
 - Source type: `router`
