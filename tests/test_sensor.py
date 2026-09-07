@@ -6,11 +6,22 @@ sensors (32 entities on a healthy cable plant) behind a
 suite covers the boundary:
   - With the flag off, only router-level sensors are created.
   - With the flag on, per-channel sensors are created.
+
+v0.3.1 additionally covers the DOCSIS degradation UX: the per-channel
+sensors' docsis_stale/last_good attributes and the docsis_data_ok
+binary sensor that flips off while the modem serves HTML instead of
+JSON.
 """
 from unittest.mock import MagicMock, patch
 
 import pytest
+from homeassistant.components.binary_sensor import BinarySensorDeviceClass
+from homeassistant.util import dt as dt_util
 
+from custom_components.hitron_coda_5610q.binary_sensor import (
+    HitronDocsisOkBinarySensor,
+    async_setup_entry as async_setup_binary_sensor,
+)
 from custom_components.hitron_coda_5610q.const import (
     CONF_EXPOSE_DIAGNOSTICS,
     DOMAIN,
@@ -18,6 +29,7 @@ from custom_components.hitron_coda_5610q.const import (
 from custom_components.hitron_coda_5610q.sensor import (
     HitronDownstreamSensor,
     HitronRouterSensor,
+    HitronSensorEntityDescription,
     HitronUpstreamSensor,
     ROUTER_SENSORS,
     async_setup_entry,
@@ -171,3 +183,133 @@ async def test_per_channel_sensors_explicitly_off():
     assert len(added) == len(ROUTER_SENSORS)
     assert not any(isinstance(s, HitronDownstreamSensor) for s in added)
     assert not any(isinstance(s, HitronUpstreamSensor) for s in added)
+
+
+# ---- v0.3.1: DOCSIS degradation staleness attributes ----
+
+
+def _channel_sensor_stub(coordinator):
+    """Build a HitronDownstreamSensor/HitronUpstreamSensor pair directly."""
+    ds = HitronDownstreamSensor(
+        coordinator,
+        HitronSensorEntityDescription(key="ds_1_snr", name="DS Channel 1 SNR"),
+        channel_index=0,
+        attr="snr",
+    )
+    us = HitronUpstreamSensor(
+        coordinator,
+        HitronSensorEntityDescription(key="us_5_power", name="US Channel 5 Power"),
+        channel_index=0,
+        attr="signal_strength",
+    )
+    return ds, us
+
+
+async def test_channel_sensors_report_staleness_during_degradation():
+    """v0.3.1: while the backing endpoint is degraded, channel sensors
+    flag docsis_stale=True and expose a last_good ISO timestamp; the
+    non-degraded tier reports docsis_stale=False.
+    """
+    data = _make_coordinator_data(downstream=1, upstream=1)
+    hass, coordinator = _make_hass(data)
+    ds_sensor, us_sensor = _channel_sensor_stub(coordinator)
+
+    last_good = dt_util.utcnow()
+
+    def _degraded_fields(field: str) -> bool:
+        return field == "downstream_channels"
+
+    def _last_good(field: str):
+        return last_good if field == "downstream_channels" else None
+
+    coordinator.is_degraded = _degraded_fields
+    coordinator.field_last_good = _last_good
+
+    ds_attrs = ds_sensor.extra_state_attributes
+    assert ds_attrs["docsis_stale"] is True
+    assert ds_attrs["last_good"] == last_good.isoformat()
+
+    us_attrs = us_sensor.extra_state_attributes
+    assert us_attrs["docsis_stale"] is False
+    assert "last_good" not in us_attrs
+
+
+async def test_channel_sensors_report_fresh_when_not_degraded():
+    """Healthy cycle: docsis_stale is False and no last_good attribute."""
+    data = _make_coordinator_data(downstream=1, upstream=1)
+    hass, coordinator = _make_hass(data)
+    ds_sensor, us_sensor = _channel_sensor_stub(coordinator)
+
+    coordinator.is_degraded = lambda field: False
+    coordinator.field_last_good = lambda field: None
+
+    for sensor in (ds_sensor, us_sensor):
+        attrs = sensor.extra_state_attributes
+        assert attrs["docsis_stale"] is False
+        assert "last_good" not in attrs
+
+
+# ---- v0.3.1: docsis_data_ok binary sensor ----
+
+
+async def test_binary_sensor_setup_creates_docsis_data_ok():
+    """The docsis_data_ok connectivity entity is created with the rest
+    of the binary sensor platform."""
+    data = _make_coordinator_data()
+    hass, coordinator = _make_hass(data)
+    entry = _make_entry()
+
+    added: list = []
+    await async_setup_binary_sensor(hass, entry, _capture_callback(added))
+
+    entity = next(
+        s for s in added if isinstance(s, HitronDocsisOkBinarySensor)
+    )
+    assert entity.unique_id == f"{DOMAIN}_docsis_data_ok"
+    assert entity.device_class == BinarySensorDeviceClass.CONNECTIVITY
+
+
+async def test_docsis_data_ok_flips_off_during_degradation_and_back_on():
+    """The full automation story: healthy → degraded (the live defect)
+    → recovery, with the degraded_endpoints/since attributes following.
+    """
+    data = _make_coordinator_data()
+    hass, coordinator = _make_hass(data)
+    entry = _make_entry()
+
+    added: list = []
+    await async_setup_binary_sensor(hass, entry, _capture_callback(added))
+    entity = next(
+        s for s in added if isinstance(s, HitronDocsisOkBinarySensor)
+    )
+
+    # Healthy: on, no degraded endpoints, no window start.
+    coordinator.docsis_degraded = False
+    coordinator.docsis_degraded_endpoints = []
+    coordinator.degraded_since = None
+    assert entity.is_on is True
+    assert entity.extra_state_attributes == {
+        "degraded_endpoints": [],
+        "since": None,
+    }
+
+    # Degraded: DsInfo/UsInfo serve the SPA login page instead of JSON.
+    since = dt_util.utcnow()
+    degraded = ["/1/Device/CM/DsInfo", "/1/Device/CM/UsInfo"]
+    coordinator.docsis_degraded = True
+    coordinator.docsis_degraded_endpoints = degraded
+    coordinator.degraded_since = since
+    assert entity.is_on is False
+    attrs = entity.extra_state_attributes
+    assert attrs["degraded_endpoints"] == degraded
+    assert attrs["since"] == since.isoformat()
+
+    # Recovery: back on with the tracking reset.
+    coordinator.docsis_degraded = False
+    coordinator.docsis_degraded_endpoints = []
+    coordinator.degraded_since = None
+    assert entity.is_on is True
+    assert entity.extra_state_attributes == {
+        "degraded_endpoints": [],
+        "since": None,
+    }

@@ -15,14 +15,29 @@ v0.3.0: tiered polling + single-flight login + last-good data.
   up to _LAST_GOOD_CYCLES fast cycles before the entities are marked
   unavailable. A single transient router hiccup no longer flips all 47
   trackers to unavailable/not_home.
+
+v0.3.1: graceful DOCSIS degradation.
+
+- The modem firmware intermittently serves the SPA login page (HTML)
+  instead of JSON on the /1/Device/CM/ endpoints while Login and the
+  host list keep working; re-login does not clear it (verified live).
+  A slow-tier endpoint failing with HitronEndpointDegradedError no
+  longer fails the whole update: the field keeps its previous value
+  and the coordinator tracks the degraded endpoints plus the start of
+  the degradation window, so the docsis_data_ok binary sensor and the
+  sensors' docsis_stale/last_good attributes can report it. Any other
+  failure class keeps the v0.3.0 semantics unchanged — including mixed
+  cycles where one endpoint is degraded and another hard-fails.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field, replace
-from datetime import timedelta
+from datetime import datetime, timedelta
+from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -31,6 +46,7 @@ from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
 )
+from homeassistant.util import dt as dt_util
 
 from .api import (
     ConnectedDevice,
@@ -38,6 +54,7 @@ from .api import (
     HitronAuthError,
     HitronConnectionError,
     HitronCodaAPI,
+    HitronEndpointDegradedError,
     SystemInfo,
     UpstreamChannel,
 )
@@ -47,7 +64,9 @@ from .const import (
     DEFAULT_FAST_INTERVAL,
     DEFAULT_SLOW_INTERVAL,
     DEFAULT_SCAN_INTERVAL,
+    DOCSIS_ENDPOINT_FIELDS,
     DOMAIN,
+    MODEL,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -77,6 +96,50 @@ class HitronCodaCoordinator(DataUpdateCoordinator[HitronCodaData]):
     """Single coordinator shared by all entity platforms."""
 
     config_entry: ConfigEntry
+
+    # Slow-tier fetch plan: HitronCodaData field name -> API method name.
+    # The order defines the gather order and therefore the order of the
+    # per-endpoint degradation report.
+    _SLOW_FETCHERS: tuple[tuple[str, str], ...] = (
+        ("system_info", "get_system_info"),
+        ("router_sys_info", "get_router_sys_info"),
+        ("downstream_channels", "get_downstream_channels"),
+        ("upstream_channels", "get_upstream_channels"),
+        ("dhcp_reservations", "get_dhcp_reservations"),
+        ("docsis_provisioning", "get_docsis_provisioning"),
+        ("cm_sys_info", "get_cm_sys_info"),
+        ("wifi_radios", "get_wifi_radios"),
+        ("firewall_status", "get_firewall_status"),
+        ("ethernet_ports", "get_ethernet_ports"),
+    )
+
+    # v0.3.1: fallback factories for slow-tier fields that degrade
+    # before any successful fetch (first refresh during an outage).
+    # Empty containers keep the update alive — presence and the
+    # docsis_data_ok binary sensor keep working — while the affected
+    # sensors simply have nothing to show yet.
+    _SLOW_EMPTY: dict[str, Callable[[], Any]] = {
+        "system_info": lambda: SystemInfo(
+            serial_number="",
+            model_name=MODEL,
+            hardware_version="",
+            software_version="",
+            api_version="",
+            vendor_name="",
+            device_id="",
+            deployment_name="",
+            wifi_chip="",
+        ),
+        "router_sys_info": dict,
+        "downstream_channels": list,
+        "upstream_channels": list,
+        "dhcp_reservations": list,
+        "docsis_provisioning": dict,
+        "cm_sys_info": dict,
+        "wifi_radios": list,
+        "firewall_status": dict,
+        "ethernet_ports": list,
+    }
 
     def __init__(
         self,
@@ -109,6 +172,17 @@ class HitronCodaCoordinator(DataUpdateCoordinator[HitronCodaData]):
         self._cycle = 0
         self._last_good: HitronCodaData | None = None
         self._last_good_age_cycles = 0
+
+        # v0.3.1: per-endpoint degradation tracking. ``_degraded`` maps
+        # HitronCodaData field names to the endpoint path currently
+        # serving HTML instead of JSON; ``_degraded_since`` marks the
+        # start of the continuous degradation window (reported by the
+        # docsis_data_ok binary sensor); ``_field_good_at`` remembers
+        # when each slow-tier field was last fetched successfully so
+        # sensors can expose a last_good timestamp.
+        self._degraded: dict[str, str] = {}
+        self._degraded_since: datetime | None = None
+        self._field_good_at: dict[str, datetime] = {}
 
         # v0.3.0: single-flight login lock. The CODA issues a fresh
         # PHPSESSID on every login; two overlapping logins invalidate each
@@ -143,15 +217,22 @@ class HitronCodaCoordinator(DataUpdateCoordinator[HitronCodaData]):
             async with sem:
                 return await coro
 
+        prev = self._last_good
+
         # ---- fast tier (always) ----
+        # Presence runs first and on its own wave: its two requests fit
+        # the semaphore in one pass, so trackers see the freshest host
+        # list before the slow tier starts.
         try:
-            devices_task = _bounded(self.api.get_connected_devices())
-            wifi_clients_task = _bounded(self.api.get_wifi_clients())
-            if slow_due:
-                # ---- slow tier (every Nth cycle) ----
+            devices, wifi_clients = await asyncio.gather(
+                _bounded(self.api.get_connected_devices()),
+                _bounded(self.api.get_wifi_clients()),
+            )
+
+            # ---- slow tier ----
+            # The first cycle always does a full fetch (nothing to reuse).
+            if slow_due or prev is None:
                 (
-                    devices,
-                    wifi_clients,
                     system_info,
                     router_sys_info,
                     ds_channels,
@@ -162,62 +243,25 @@ class HitronCodaCoordinator(DataUpdateCoordinator[HitronCodaData]):
                     wifi_radios,
                     firewall,
                     eth_ports,
-                ) = await asyncio.gather(
-                    devices_task,
-                    wifi_clients_task,
-                    _bounded(self.api.get_system_info()),
-                    _bounded(self.api.get_router_sys_info()),
-                    _bounded(self.api.get_downstream_channels()),
-                    _bounded(self.api.get_upstream_channels()),
-                    _bounded(self.api.get_dhcp_reservations()),
-                    _bounded(self.api.get_docsis_provisioning()),
-                    _bounded(self.api.get_cm_sys_info()),
-                    _bounded(self.api.get_wifi_radios()),
-                    _bounded(self.api.get_firewall_status()),
-                    _bounded(self.api.get_ethernet_ports()),
+                ) = await self._async_fetch_slow_tier(
+                    prev,
+                    {
+                        field: _bounded(getattr(self.api, method)())
+                        for field, method in self._SLOW_FETCHERS
+                    },
                 )
             else:
-                devices, wifi_clients = await asyncio.gather(
-                    devices_task, wifi_clients_task
-                )
                 # Reuse last slow-tier data
-                prev = self._last_good
-                if prev is not None:
-                    system_info = prev.system_info
-                    router_sys_info = prev.router_sys_info
-                    ds_channels = prev.downstream_channels
-                    us_channels = prev.upstream_channels
-                    reservations = prev.dhcp_reservations
-                    docs_prov = prev.docsis_provisioning
-                    cm_sys = prev.cm_sys_info
-                    wifi_radios = prev.wifi_radios
-                    firewall = prev.firewall_status
-                    eth_ports = prev.ethernet_ports
-                else:
-                    # First cycle: do a full fetch so nothing is missing.
-                    (
-                        system_info,
-                        router_sys_info,
-                        ds_channels,
-                        us_channels,
-                        reservations,
-                        docs_prov,
-                        cm_sys,
-                        wifi_radios,
-                        firewall,
-                        eth_ports,
-                    ) = await asyncio.gather(
-                        _bounded(self.api.get_system_info()),
-                        _bounded(self.api.get_router_sys_info()),
-                        _bounded(self.api.get_downstream_channels()),
-                        _bounded(self.api.get_upstream_channels()),
-                        _bounded(self.api.get_dhcp_reservations()),
-                        _bounded(self.api.get_docsis_provisioning()),
-                        _bounded(self.api.get_cm_sys_info()),
-                        _bounded(self.api.get_wifi_radios()),
-                        _bounded(self.api.get_firewall_status()),
-                        _bounded(self.api.get_ethernet_ports()),
-                    )
+                system_info = prev.system_info
+                router_sys_info = prev.router_sys_info
+                ds_channels = prev.downstream_channels
+                us_channels = prev.upstream_channels
+                reservations = prev.dhcp_reservations
+                docs_prov = prev.docsis_provisioning
+                cm_sys = prev.cm_sys_info
+                wifi_radios = prev.wifi_radios
+                firewall = prev.firewall_status
+                eth_ports = prev.ethernet_ports
         except HitronAuthError as err:
             raise ConfigEntryAuthFailed(err) from err
         except HitronConnectionError as err:
@@ -251,6 +295,66 @@ class HitronCodaCoordinator(DataUpdateCoordinator[HitronCodaData]):
         self._last_good_age_cycles = 0
         return data
 
+    async def _async_fetch_slow_tier(
+        self,
+        prev: HitronCodaData | None,
+        fetches: dict[str, Coroutine[Any, Any, Any]],
+    ) -> tuple[Any, ...]:
+        """Run the slow-tier fetches with per-endpoint degradation tolerance.
+
+        v0.3.1: a ``HitronEndpointDegradedError`` (firmware serving the
+        SPA login page instead of JSON) is absorbed — the field falls
+        back to its previous value, or to an empty container when no
+        previous value exists yet, and the endpoint is recorded as
+        degraded. Every other failure is re-raised after the degradation
+        state is updated, so the caller's existing last-good window and
+        auth handling apply unchanged: mixed cycles (one endpoint
+        degraded, another hard-failing) keep the v0.3.0 failure
+        semantics for the non-degraded part.
+        """
+        results = await asyncio.gather(*fetches.values(), return_exceptions=True)
+        now = dt_util.utcnow()
+        values: dict[str, Any] = {}
+        degraded: dict[str, str] = {}
+        first_error: BaseException | None = None
+        for field, result in zip(fetches, results):
+            if isinstance(result, HitronEndpointDegradedError):
+                degraded[field] = result.endpoint
+                values[field] = (
+                    getattr(prev, field)
+                    if prev is not None
+                    else self._SLOW_EMPTY[field]()
+                )
+            elif isinstance(result, BaseException):
+                if first_error is None:
+                    first_error = result
+            else:
+                values[field] = result
+                self._field_good_at[field] = now
+        self._apply_degraded_state(degraded)
+        if first_error is not None:
+            raise first_error
+        return tuple(values[field] for field in fetches)
+
+    def _apply_degraded_state(self, degraded: dict[str, str]) -> None:
+        """Record the degradation observed by the finished slow cycle.
+
+        ``degraded`` maps HitronCodaData field names to the endpoint
+        path that served HTML. ``_degraded_since`` marks the START of
+        the continuous degradation window and is only cleared by a fully
+        healthy slow cycle — fast-only cycles in between never touch it,
+        so the docsis_data_ok binary sensor reports a stable "off
+        since" even though the DOCSIS endpoints are only re-probed on
+        slow cycles.
+        """
+        if degraded:
+            if not self._degraded:
+                self._degraded_since = dt_util.utcnow()
+            self._degraded = dict(degraded)
+        else:
+            self._degraded = {}
+            self._degraded_since = None
+
     async def async_login_locked(self) -> None:
         """Re-authenticate under the single-flight lock."""
         async with self._login_lock:
@@ -263,3 +367,43 @@ class HitronCodaCoordinator(DataUpdateCoordinator[HitronCodaData]):
     @property
     def fast_interval(self) -> int:
         return self._fast_interval
+
+    # ---- v0.3.1: degradation reporting surface ----
+
+    @property
+    def degraded_endpoints(self) -> list[str]:
+        """All endpoint paths currently serving HTML instead of JSON."""
+        return list(self._degraded.values())
+
+    @property
+    def degraded_since(self) -> datetime | None:
+        """Start of the current degradation window (None = healthy)."""
+        return self._degraded_since
+
+    @property
+    def docsis_degraded_endpoints(self) -> list[str]:
+        """Degraded endpoints belonging to the modem's DOCSIS plane.
+
+        Filters the full degraded set down to the /1/Device/CM/ family
+        (see DOCSIS_ENDPOINT_FIELDS) so a degraded host list — a
+        different problem with different remediation — does not trip
+        the docsis_data_ok binary sensor.
+        """
+        return [
+            endpoint
+            for field, endpoint in self._degraded.items()
+            if field in DOCSIS_ENDPOINT_FIELDS
+        ]
+
+    @property
+    def docsis_degraded(self) -> bool:
+        """True while one or more DOCSIS endpoints serve degraded data."""
+        return bool(self.docsis_degraded_endpoints)
+
+    def is_degraded(self, field: str) -> bool:
+        """True when the field is being served from the last-good window."""
+        return field in self._degraded
+
+    def field_last_good(self, field: str) -> datetime | None:
+        """When the field was last fetched successfully (None = never)."""
+        return self._field_good_at.get(field)
