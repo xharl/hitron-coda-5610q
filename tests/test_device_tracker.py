@@ -45,6 +45,10 @@ def _make_coordinator(devices: list[ConnectedDevice]):
         wifi_chip="BCM4366",
     )
     coord.data.wifi_clients = []
+    # v0.3.0: MagicMock auto-creates attributes — explicitly None out the
+    # hysteresis store so tests exercise the no-store fallback path.
+    coord.identity_store = None
+    coord.presence_grace = 240
     return coord
 
 
@@ -112,7 +116,7 @@ async def test_unique_id_uses_hostname_when_available():
     coord = _make_coordinator([_device(mac1, status=True, hostname="pixel-6")])
     identity = _identity(mac1, "pixel-6")
     tracker = HitronCodaDeviceTracker(coord, identity)
-    expected = make_entity_unique_id("hostname", "pixel-6", mac1)
+    expected = make_entity_unique_id("hostname", "pixel-6", "pixel-6", mac1)
     assert tracker.unique_id == expected
     # And rotating the MAC produces the same unique_id
     identity.current_mac = mac2
@@ -127,7 +131,7 @@ async def test_unique_id_falls_back_to_mac_when_no_hostname():
     tracker = HitronCodaDeviceTracker(coord, identity)
     # When hostname is None/empty, make_entity_unique_id takes the
     # MAC-tracking branch and returns ``f"{DOMAIN}_{mac}"``.
-    expected = make_entity_unique_id("hostname", None, mac)
+    expected = make_entity_unique_id("hostname", None, None, mac)
     assert tracker.unique_id == expected
 
 
@@ -157,3 +161,31 @@ async def test_extra_state_attributes_includes_wifi_info():
     assert attrs["current_mac"] == mac
     assert attrs["interface"] == "WiFi 2.4G"
     assert attrs["action"] == "Resume"
+
+
+async def test_grace_window_keeps_device_home_after_disappearance():
+    """v0.3.0: a device that drops off the host list stays 'home' within
+    the grace window when the identity store has a fresh last_seen."""
+    mac = "AA:BB:CC:DD:EE:FF"
+    coord = _make_coordinator([])  # device gone from the list
+    store = MagicMock()
+    store.seen_within = MagicMock(return_value=True)  # seen 10s ago
+    coord.identity_store = store
+    coord.presence_grace = 240
+    tracker = HitronCodaDeviceTracker(coord, _identity(mac, "phone"))
+    assert tracker.state == STATE_HOME
+    assert store.seen_within.call_count >= 1
+    store.seen_within.assert_any_call(mac, 240)
+
+
+async def test_router_pause_is_immediate_not_home():
+    """v0.3.0: router-reported Pause (status=False, still listed) is
+    respected immediately — no grace window applies."""
+    mac = "AA:BB:CC:DD:EE:FF"
+    coord = _make_coordinator([_device(mac, status=False, hostname="phone")])
+    store = MagicMock()
+    store.seen_within = MagicMock(return_value=True)  # even with fresh last-seen
+    coord.identity_store = store
+    coord.presence_grace = 240
+    tracker = HitronCodaDeviceTracker(coord, _identity(mac, "phone"))
+    assert tracker.state == STATE_NOT_HOME
