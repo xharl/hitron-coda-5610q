@@ -276,7 +276,7 @@ class HitronCodaDeviceTracker(CoordinatorEntity[HitronCodaCoordinator], ScannerE
             manufacturer=self._identity.oui_label or "Unknown",
             model="LAN device",
             name=name,
-            via_device_id=(
+            via_device=(
                 DOMAIN,
                 self.coordinator.data.system_info.serial_number,
             ),
