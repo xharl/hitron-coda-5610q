@@ -12,7 +12,13 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 
 from .api import HitronCodaAPI
-from .const import DEFAULT_SCAN_INTERVAL, DOMAIN, SERVICE_MIGRATE_TO_V0_2_13
+from .const import (
+    CONF_PRESENCE_GRACE,
+    DEFAULT_PRESENCE_GRACE,
+    DEFAULT_SCAN_INTERVAL,
+    DOMAIN,
+    SERVICE_MIGRATE_TO_V0_2_13,
+)
 from .coordinator import HitronCodaCoordinator
 from .device_tracker import register_services as _register_dt_services
 
@@ -35,7 +41,7 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Hitron CODA-5610Q from a config entry."""
-    _LOGGER.warning(
+    _LOGGER.debug(
         "hitron_coda_5610q.async_setup_entry START entry_id=%s data_keys=%s",
         entry.entry_id,
         list(entry.data.keys()),
@@ -60,9 +66,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
         coordinator = HitronCodaCoordinator(hass, entry, api, scan_interval)
-        _LOGGER.warning("hitron_coda_5610q: starting first refresh")
+        _LOGGER.debug("hitron_coda_5610q: starting first refresh")
         await coordinator.async_config_entry_first_refresh()
-        _LOGGER.warning("hitron_coda_5610q: first refresh OK")
+        _LOGGER.debug("hitron_coda_5610q: first refresh OK")
+
+        # v0.3.0: presence hysteresis config rides on the coordinator
+        try:
+            grace = max(0, int(entry.options.get(CONF_PRESENCE_GRACE, DEFAULT_PRESENCE_GRACE)))
+        except (TypeError, ValueError):
+            grace = DEFAULT_PRESENCE_GRACE
+        coordinator.presence_grace = grace  # type: ignore[attr-defined]
 
         hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 
@@ -72,9 +85,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # ones, then reloads the config entry.
         _register_dt_services(hass)
 
-        _LOGGER.warning("hitron_coda_5610q: forwarding setups to %s", PLATFORMS)
+        _LOGGER.debug("hitron_coda_5610q: forwarding setups to %s", PLATFORMS)
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-        _LOGGER.warning("hitron_coda_5610q: forwards OK")
+        _LOGGER.debug("hitron_coda_5610q: forwards OK")
 
         # Re-schedule the periodic update loop now that all entity
         # platforms have registered their listeners. The first

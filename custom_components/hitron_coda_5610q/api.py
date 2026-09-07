@@ -14,6 +14,7 @@ Key findings:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -102,6 +103,10 @@ class HitronCodaAPI:
         self._password = password
         self._cookies: dict[str, str] = {}
         self._csrf_token: str | None = None
+        # v0.3.0: single-flight login. The CODA issues a fresh PHPSESSID
+        # per login; overlapping logins (e.g. 12 parallel request retries)
+        # invalidate each other's session and cause 401 storms.
+        self._login_lock = asyncio.Lock()
 
     async def _request_json(self, url: URL) -> dict[str, Any]:
         """GET an endpoint and return parsed JSON.
@@ -132,7 +137,7 @@ class HitronCodaAPI:
                     url, cookies=self._cookies, headers=headers
                 ) as resp:
                     if resp.status in (401, 403):
-                        # Session expired — re-login and retry
+                        # Session expired — re-login (single-flight) and retry
                         await self.login()
                         async with self._session.get(
                             url, cookies=self._cookies, headers=headers
@@ -155,7 +160,9 @@ class HitronCodaAPI:
                     "HitronCodaAPI: GET %s failed (attempt %d/3): %s",
                     url, attempt + 1, err,
                 )
-                # Re-login before retrying in case the session died
+                # Re-login before retrying in case the session died.
+                # v0.3.0: under the single-flight lock so overlapping
+                # retries can't invalidate each other's PHPSESSID.
                 try:
                     await self.login()
                 except Exception:
@@ -174,7 +181,6 @@ class HitronCodaAPI:
                 except Exception:
                     pass
             # Small backoff between retries
-            import asyncio
             await asyncio.sleep(0.5 * (attempt + 1))
         # All retries exhausted
         raise HitronConnectionError(
@@ -182,6 +188,11 @@ class HitronCodaAPI:
         ) from last_err
 
     async def login(self) -> None:
+        """Single-flight re-auth (v0.3.0). Serializes under _login_lock."""
+        async with self._login_lock:
+            await self._login_impl()
+
+    async def _login_impl(self) -> None:
         """Authenticate and store the session cookie.
 
         The router expects form-urlencoded with a JSON blob in the

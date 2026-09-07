@@ -44,3 +44,19 @@ CONF_DEVICE_ALIASES = "device_aliases"
 # New in v0.2.15: when True, include the device OUI/manufacturer in the
 # display name for still-unidentified devices.
 CONF_USE_OUI_LABEL = "use_oui_label"
+
+# v0.3.0: presence hysteresis + tiered polling.
+# CONF_PRESENCE_GRACE: seconds to keep reporting "home" after a device
+# last appeared in the router's host list. This absorbs the CODA's
+# transient host-list drops (WiFi power-save, band steering, empty-body
+# hiccups) that caused instant not_home flapping.
+CONF_PRESENCE_GRACE = "presence_grace_seconds"
+DEFAULT_PRESENCE_GRACE = 240
+
+# v0.3.0: tiered polling. The host list (the only time-critical endpoint)
+# polls at fast_interval; DOCSIS/diagnostic endpoints poll at
+# slow_interval, cutting total request volume ~3x.
+CONF_FAST_INTERVAL = "fast_interval"
+DEFAULT_FAST_INTERVAL = 30
+CONF_SLOW_INTERVAL = "slow_interval"
+DEFAULT_SLOW_INTERVAL = 300

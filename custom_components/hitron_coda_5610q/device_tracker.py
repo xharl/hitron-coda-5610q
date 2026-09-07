@@ -50,13 +50,16 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import (
     CONF_DEVICE_ALIASES,
     CONF_ENABLE_MDNS,
+    CONF_PRESENCE_GRACE,
     CONF_USE_OUI_LABEL,
+    DEFAULT_PRESENCE_GRACE,
     DOMAIN,
     SERVICE_MIGRATE_TO_V0_2_13,
 )
 from .coordinator import HitronCodaCoordinator
 from .fingerprint import DeviceFingerprinter
 from .oui import lookup_oui
+from .presence import IdentityStore
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -210,18 +213,37 @@ class HitronCodaDeviceTracker(CoordinatorEntity[HitronCodaCoordinator], ScannerE
     def is_connected(self) -> bool:
         """True iff the device is currently in the router's active list.
 
-        The match is by MAC because the router still reports by MAC. If
-        the device rotated its MAC, `current_mac` has already been
-        updated, so this lookup is straightforward.
+        v0.3.0 hysteresis: the CODA's host list transiently drops devices
+        (WiFi power-save, band steering, empty-body router hiccups). A
+        hard boolean flapped to not_home on a single 30 s miss. Now:
+        - presence is recorded in the shared store each time the device
+          appears with status=1
+        - after a miss, we keep reporting home for CONF_PRESENCE_GRACE
+          seconds before falling to not_home
         """
+        store: IdentityStore | None = getattr(self.coordinator, "identity_store", None)
+        grace = getattr(self.coordinator, "presence_grace", DEFAULT_PRESENCE_GRACE)
         if not self.coordinator.data or not self.coordinator.data.devices:
             _LOGGER.debug(
                 "hitron_coda_5610q device_tracker: is_connected called but no coordinator data"
             )
+            # No data at all: fall back to last-seen grace instead of
+            # instantly reporting not_home for every device.
+            if store is not None and store.seen_within(self._identity.current_mac, grace):
+                return True
             return False
         for d in self.coordinator.data.devices:
             if d.mac_address == self._identity.current_mac:
-                return d.status
+                if d.status:
+                    if store is not None:
+                        store.touch(self._identity.current_mac)
+                    return True
+                # Router explicitly says paused/offline: respect it
+                # immediately (parental-control Pause is deliberate).
+                return False
+        # Not in the list this cycle: grace window
+        if store is not None and store.seen_within(self._identity.current_mac, grace):
+            return True
         return False
 
     @property
@@ -254,7 +276,7 @@ class HitronCodaDeviceTracker(CoordinatorEntity[HitronCodaCoordinator], ScannerE
             manufacturer=self._identity.oui_label or "Unknown",
             model="LAN device",
             name=name,
-            via_device=(
+            via_device_id=(
                 DOMAIN,
                 self.coordinator.data.system_info.serial_number,
             ),
@@ -349,12 +371,22 @@ async def async_setup_entry(
     track_by = entry.options.get("track_by", "hostname")
     fingerprinter = DeviceFingerprinter(hass, entry.options)
 
-    host_to_identity = await _build_identities(hass, coordinator, fingerprinter, track_by)
+    # v0.3.0: persistent identity store. Keys learned in previous sessions
+    # survive restarts even when the router flaps hostnames.
+    store = IdentityStore(hass, entry.entry_id)
+    await store.async_load()
+    coordinator.identity_store = store  # type: ignore[attr-defined]
+
+    host_to_identity = await _build_identities(hass, coordinator, fingerprinter, track_by, store)
     _LOGGER.debug(
         "hitron_coda_5610q device_tracker: built %d identities (track_by=%s)",
         len(host_to_identity),
         track_by,
     )
+    # Persist any new MAC -> key mappings learned this cycle
+    for mac, key in _learned_mappings(host_to_identity):
+        store.remember(mac, key)
+    await store.async_save()
     for key, ident in list(host_to_identity.items())[:5]:
         _LOGGER.debug(
             "  identity key=%s mac=%s hostname=%s alias=%s oui=%s fingerprint=%s",
@@ -373,12 +405,15 @@ async def async_setup_entry(
     for key, identity in host_to_identity.items():
         tracker = tracker_store.get(key)
         if tracker is not None and tracker._identity.current_mac != identity.current_mac:
-            _LOGGER.warning(
+            _LOGGER.debug(
                 "hitron_coda_5610q device_tracker: updating MAC for key=%s %s -> %s",
                 key, tracker._identity.current_mac, identity.current_mac,
             )
             tracker._identity = identity
             tracker.async_write_ha_state()
+            if store is not None:
+                store.remember(identity.current_mac, key)
+                await store.async_save()
         elif tracker is None:
             tracker = HitronCodaDeviceTracker(coordinator, identity)
             tracker_store[key] = tracker
@@ -405,6 +440,7 @@ async def _build_identities(
     coordinator: HitronCodaCoordinator,
     fingerprinter: DeviceFingerprinter,
     track_by: str,
+    store: IdentityStore | None = None,
 ) -> dict[str, DeviceIdentity]:
     """Map stable identity key -> DeviceIdentity for all currently-seen devices.
 
@@ -473,6 +509,13 @@ async def _build_identities(
             hostname = router_hostname or resolved_name
             user_alias = alias
             base_key = hostname or mac
+            # v0.3.0 sticky identity: if this MAC had a different stable
+            # key in a previous session, prefer that key so the entity
+            # (and its history) survives router hostname flaps.
+            if store is not None:
+                sticky = store.key_for_mac(mac)
+                if sticky and track_by == "hostname":
+                    base_key = sticky
 
         oui = lookup_oui(mac)
 
@@ -493,36 +536,10 @@ async def _build_identities(
     return out
 
 
-def _existing_trackers_by_key(
-    hass: HomeAssistant,
-    entry_id: str,
-    track_by: str,
-) -> dict[str, HitronCodaDeviceTracker]:
-    """Return all live HitronCodaDeviceTracker instances for this entry, keyed.
 
-    Used during async_setup_entry to update existing entities in place.
-    The key here matches the key in _build_identities (hostname or MAC).
-    """
-    from homeassistant.helpers import entity_registry as er
-
-    reg = er.async_get(hass)
-    out: dict[str, HitronCodaDeviceTracker] = {}
-    for ent_reg_entry in reg.entities.values():
-        if (
-            ent_reg_entry.config_entry_id != entry_id
-            or ent_reg_entry.platform != DOMAIN
-            or not ent_reg_entry.entity_id.startswith("device_tracker.")
-            or not ent_reg_entry.unique_id.startswith(f"{DOMAIN}_")
-        ):
-            continue
-        if ent_reg_entry.unique_id.startswith(f"{DOMAIN}_host_"):
-            key = ent_reg_entry.unique_id.removeprefix(f"{DOMAIN}_host_")
-        else:
-            # MAC-keyed fallback unique_id is f"{DOMAIN}_{mac}". The key is
-            # the MAC portion after the underscore.
-            key = ent_reg_entry.unique_id.removeprefix(f"{DOMAIN}_")
-        out[key] = None  # type: ignore[assignment]
-    return out
+def _learned_mappings(host_to_identity: dict[str, DeviceIdentity]) -> list[tuple[str, str]]:
+    """Return (mac, key) pairs worth persisting from this identity pass."""
+    return [(ident.current_mac, key) for key, ident in host_to_identity.items()]
 
 
 # ---- migration service ----
